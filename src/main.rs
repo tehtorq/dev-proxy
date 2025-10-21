@@ -8,6 +8,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
@@ -24,6 +25,11 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+// Compile regex once at startup
+static PORT_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"https?://(?:localhost|127\.0\.0\.1|[\w\-\.]+):(\d+)").unwrap()
+});
 
 #[derive(Parser, Debug)]
 #[command(name = "dev-proxy")]
@@ -167,7 +173,28 @@ fn cmd_add(symlinks_dir: &str, name: &str, path: &str) -> Result<(), Box<dyn std
     std::fs::create_dir_all(symlinks_dir)?;
 
     let link_path = std::path::Path::new(symlinks_dir).join(name);
-    let target_path = std::path::Path::new(path).canonicalize()?;
+
+    // Validate the target path
+    let path_obj = std::path::Path::new(path);
+
+    if !path_obj.exists() {
+        return Err(format!("Path does not exist: {}", path).into());
+    }
+
+    if !path_obj.is_dir() {
+        return Err(format!("Path is not a directory: {}", path).into());
+    }
+
+    let target_path = path_obj.canonicalize()?;
+
+    // Basic security: prevent symlinking to system directories
+    let target_str = target_path.to_string_lossy();
+    let dangerous_paths = ["/etc", "/usr", "/bin", "/sbin", "/System", "/var", "/tmp"];
+    for dangerous in &dangerous_paths {
+        if target_str == *dangerous || target_str.starts_with(&format!("{}/", dangerous)) {
+            return Err(format!("Refusing to create symlink to system directory: {}", target_str).into());
+        }
+    }
 
     if link_path.exists() {
         return Err(format!("Server '{}' already exists. Remove it first with: dev-proxy remove {}", name, name).into());
@@ -286,17 +313,9 @@ impl DevServer {
         let mut child = cmd.spawn()?;
 
         // Spawn tasks to read stdout and stderr and detect port
-        // Match patterns like:
-        // - http://localhost:3000
-        // - https://localhost:3000
-        // - http://127.0.0.1:3000
-        // - http://phone.test:5174
-        // Must have http:// or https:// prefix to avoid matching timestamps
-        let port_regex = Regex::new(r"https?://(?:localhost|127\.0\.0\.1|[\w\-\.]+):(\d+)").unwrap();
         let detected_port = Arc::new(Mutex::new(None::<u16>));
 
         if let Some(stdout) = child.stdout.take() {
-            let port_regex = port_regex.clone();
             let detected_port = detected_port.clone();
             let name = self.config.name.clone();
             tokio::spawn(async move {
@@ -304,7 +323,7 @@ impl DevServer {
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     println!("[{}] {}", name, line);
-                    if let Some(caps) = port_regex.captures(&line) {
+                    if let Some(caps) = PORT_REGEX.captures(&line) {
                         if let Some(port_str) = caps.get(1) {
                             if let Ok(port) = port_str.as_str().parse::<u16>() {
                                 let mut detected = detected_port.lock().await;
@@ -327,7 +346,7 @@ impl DevServer {
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     eprintln!("[{}] {}", name, line);
-                    if let Some(caps) = port_regex.captures(&line) {
+                    if let Some(caps) = PORT_REGEX.captures(&line) {
                         if let Some(port_str) = caps.get(1) {
                             if let Ok(port) = port_str.as_str().parse::<u16>() {
                                 let mut detected = detected_port.lock().await;
@@ -367,6 +386,12 @@ impl DevServer {
             self.is_starting = false;
             info!("✅ [{}] Dev server ready on port {}", self.config.name, port);
         } else {
+            // Port detection failed - kill the child process to prevent resource leak
+            if let Some(mut child) = self.process.take() {
+                warn!("Killing dev server process due to port detection failure");
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
             self.is_starting = false;
             error!("❌ [{}] Failed to detect port", self.config.name);
             return Err("Failed to detect port".into());
@@ -480,7 +505,10 @@ where
         }
     }
 
-    // Wait if starting
+    // Wait if starting (with timeout to prevent hanging)
+    let wait_start = Instant::now();
+    let max_wait = Duration::from_secs(30);
+
     loop {
         let is_starting = {
             let servers = server_map.lock().await;
@@ -491,6 +519,14 @@ where
 
         if !is_starting {
             break;
+        }
+
+        if wait_start.elapsed() > max_wait {
+            warn!("Timeout waiting for server to start");
+            return Ok(Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .body(full_body("Server startup timeout"))
+                .unwrap());
         }
 
         sleep(Duration::from_millis(100)).await;
@@ -807,7 +843,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // From here on, we're running the proxy server
     tracing_subscriber::fmt()
-        .with_env_filter("dev_proxy=info")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("dev_proxy=info"))
+        )
         .init();
 
     info!("🔍 Scanning {} for dev servers...", symlinks_dir);
@@ -847,7 +886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Setup signal handlers
-    let signals = Signals::new(&[SIGTERM, SIGINT, SIGQUIT])?;
+    let signals = Signals::new([SIGTERM, SIGINT, SIGQUIT])?;
     let handle = signals.handle();
     let signal_map = server_map.clone();
 

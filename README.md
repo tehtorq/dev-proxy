@@ -28,9 +28,9 @@ Auto-detects and uses the right one:
 - yarn
 
 ### Operating Systems
-- macOS
-- Linux
-- Windows (untested)
+- macOS ✅
+- Linux ✅
+- Windows ⚠️ (Basic functionality works, but graceful shutdown requires Ctrl+C handling. Signal handling is Unix-only)
 
 ## Features
 
