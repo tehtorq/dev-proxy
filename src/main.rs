@@ -168,7 +168,7 @@ fn get_default_symlinks_dir() -> String {
     }
 }
 
-fn cmd_add(symlinks_dir: &str, name: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_add(symlinks_dir: &str, name: &str, path: &str, domain_suffix: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create symlinks directory if it doesn't exist
     std::fs::create_dir_all(symlinks_dir)?;
 
@@ -187,15 +187,6 @@ fn cmd_add(symlinks_dir: &str, name: &str, path: &str) -> Result<(), Box<dyn std
 
     let target_path = path_obj.canonicalize()?;
 
-    // Basic security: prevent symlinking to system directories
-    let target_str = target_path.to_string_lossy();
-    let dangerous_paths = ["/etc", "/usr", "/bin", "/sbin", "/System", "/var", "/tmp"];
-    for dangerous in &dangerous_paths {
-        if target_str == *dangerous || target_str.starts_with(&format!("{}/", dangerous)) {
-            return Err(format!("Refusing to create symlink to system directory: {}", target_str).into());
-        }
-    }
-
     if link_path.exists() {
         return Err(format!("Server '{}' already exists. Remove it first with: dev-proxy remove {}", name, name).into());
     }
@@ -208,7 +199,7 @@ fn cmd_add(symlinks_dir: &str, name: &str, path: &str) -> Result<(), Box<dyn std
     std::os::windows::fs::symlink_dir(&target_path, &link_path)?;
 
     println!("✅ Added {} → {}", name, target_path.display());
-    println!("   Access at http://{}.test", name);
+    println!("   Access at http://{}.{}", name, domain_suffix);
 
     Ok(())
 }
@@ -828,7 +819,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle subcommands
     match args.command {
         Some(Command::Add { name, path }) => {
-            return cmd_add(&symlinks_dir, &name, &path);
+            return cmd_add(&symlinks_dir, &name, &path, &args.domain_suffix);
         }
         Some(Command::Remove { name }) => {
             return cmd_remove(&symlinks_dir, &name);
