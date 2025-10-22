@@ -1,4 +1,4 @@
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -16,11 +16,18 @@ use tokio::sync::mpsc;
 
 const MAX_LINES: usize = 200;
 
+#[derive(Debug, Clone)]
+pub enum ServerCommand {
+    Kill(String),    // Server name
+    Restart(String), // Server name
+}
+
 // Pre-formatted, ready-to-render log lines for each server
 pub struct LogStore {
     servers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     all_logs_cache: Arc<Mutex<Vec<String>>>,
     active_servers: Arc<Mutex<HashSet<String>>>,
+    running_servers: Arc<Mutex<HashSet<String>>>,  // Track actual process state
     version: Arc<AtomicU64>,
 }
 
@@ -30,8 +37,19 @@ impl LogStore {
             servers: Arc::new(Mutex::new(HashMap::new())),
             all_logs_cache: Arc::new(Mutex::new(Vec::new())),
             active_servers: Arc::new(Mutex::new(HashSet::new())),
+            running_servers: Arc::new(Mutex::new(HashSet::new())),
             version: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn set_server_running(&self, server_name: String) {
+        let mut running = self.running_servers.lock().unwrap();
+        running.insert(server_name);
+    }
+
+    pub fn set_server_stopped(&self, server_name: String) {
+        let mut running = self.running_servers.lock().unwrap();
+        running.remove(&server_name);
     }
 
     pub fn add_line(&self, server_name: String, line: String) {
@@ -82,6 +100,10 @@ impl LogStore {
     pub fn get_active_servers_snapshot(&self) -> HashSet<String> {
         self.active_servers.lock().unwrap().clone()
     }
+
+    pub fn get_running_servers_snapshot(&self) -> HashSet<String> {
+        self.running_servers.lock().unwrap().clone()
+    }
 }
 
 pub struct ServerInfo {
@@ -93,11 +115,14 @@ pub struct TuiApp {
     servers: Vec<ServerInfo>,
     selected_index: usize,
     scroll_offset: u16,
+    visible_height: u16,  // Track terminal height for scroll bounds
     cached_logs: Vec<String>,
     cached_active_servers: HashSet<String>,
+    running_servers: HashSet<String>,  // Track which servers are actually running
     log_store: Arc<LogStore>,
     last_version: u64,
     last_draw_time: Instant,
+    command_tx: Option<mpsc::UnboundedSender<ServerCommand>>,
 }
 
 impl TuiApp {
@@ -106,12 +131,19 @@ impl TuiApp {
             servers,
             selected_index: 0,
             scroll_offset: 0,
+            visible_height: 20,  // Default, will be updated during render
             cached_logs: Vec::new(),
             cached_active_servers: HashSet::new(),
+            running_servers: HashSet::new(),
             log_store: Arc::new(LogStore::new()), // Placeholder, will be set later
             last_version: 0,
             last_draw_time: Instant::now(),
+            command_tx: None,
         }
+    }
+
+    pub fn set_command_sender(&mut self, tx: mpsc::UnboundedSender<ServerCommand>) {
+        self.command_tx = Some(tx);
     }
 
     pub fn has_log_changes(&self) -> bool {
@@ -122,6 +154,10 @@ impl TuiApp {
         let selected = self.get_selected_server();
         self.cached_logs = self.log_store.get_lines(selected);
         self.cached_active_servers = self.log_store.get_active_servers_snapshot();
+
+        // Get running status directly from LogStore (no log parsing!)
+        self.running_servers = self.log_store.get_running_servers_snapshot();
+
         self.last_version = self.log_store.get_version();
     }
 
@@ -142,10 +178,17 @@ impl TuiApp {
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_add(1);
+        // Don't scroll past the last visible line
+        let total_lines = self.cached_logs.len() as u16;
+        let max_scroll = total_lines.saturating_sub(self.visible_height);
+
+        if self.scroll_offset < max_scroll {
+            self.scroll_offset = self.scroll_offset.saturating_add(1);
+        }
     }
 
     pub fn scroll_up(&mut self) {
+        // Don't scroll past the first line (already handled by saturating_sub)
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
 
@@ -168,18 +211,21 @@ impl TuiApp {
 
 pub fn run_tui_blocking(
     mut app: TuiApp,
+    log_store: Arc<LogStore>,
     mut log_rx: mpsc::UnboundedReceiver<(String, String)>,
 ) -> io::Result<()> {
     // Setup terminal
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     crossterm::terminal::enable_raw_mode()?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-
-    let log_store = Arc::new(LogStore::new());
 
     // Give app access to log_store
     app.log_store = log_store.clone();
@@ -235,7 +281,8 @@ pub fn run_tui_blocking(
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
     )?;
     terminal.show_cursor()?;
 
@@ -299,19 +346,33 @@ fn run_app(
                             let _ = std::process::Command::new("cmd").args(&["/C", "start", &url]).spawn();
                         }
                     }
-                    KeyCode::PageDown => {
+                    KeyCode::Char('z') | KeyCode::Char('Z') => {
                         for _ in 0..10 {
                             app.scroll_down();
                         }
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
-                    KeyCode::PageUp => {
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
                         for _ in 0..10 {
                             app.scroll_up();
                         }
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Char('k') => {
+                        if let Some(server) = app.get_selected_server_info() {
+                            if let Some(ref tx) = app.command_tx {
+                                let _ = tx.send(ServerCommand::Kill(server.name.clone()));
+                            }
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        if let Some(server) = app.get_selected_server_info() {
+                            if let Some(ref tx) = app.command_tx {
+                                let _ = tx.send(ServerCommand::Restart(server.name.clone()));
+                            }
+                        }
                     }
                     KeyCode::Home => {
                         app.selected_index = 0;
@@ -330,8 +391,24 @@ fn run_app(
                     _ => {}
                 }
             }
+            Ok(Event::Mouse(mouse)) => {
+                // Handle mouse wheel scrolling
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => {
+                        app.scroll_down();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    MouseEventKind::ScrollUp => {
+                        app.scroll_up();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    _ => {}
+                }
+            }
             Ok(_) => {
-                // Ignore other events (resize, mouse, etc.)
+                // Ignore other events (resize, etc.)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Timeout - check for log updates and redraw if needed
@@ -353,7 +430,7 @@ fn run_app(
     }
 }
 
-fn ui(f: &mut Frame, app: &TuiApp) {
+fn ui(f: &mut Frame, app: &mut TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -371,9 +448,9 @@ fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) 
 
     for server in &app.servers {
         // Use cached status - NO mutex lock during render!
-        let has_logs = app.cached_active_servers.contains(&server.name);
-        let status_icon = if has_logs { "●" } else { "○" };
-        let status_color = if has_logs {
+        let is_running = app.running_servers.contains(&server.name);
+        let status_icon = if is_running { "●" } else { "○" };
+        let status_color = if is_running {
             Color::Green
         } else {
             Color::DarkGray
@@ -388,7 +465,7 @@ fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Servers (↑/↓/Enter=Open/q) ")
+                .title(" Servers (↑↓=Nav Enter=Open k=Kill r=Restart q=Quit) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -405,23 +482,24 @@ fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) 
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_logs(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) {
+fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
     let selected_server = app.get_selected_server();
 
     let title = if let Some(server) = selected_server {
-        format!(" Logs: {} (PgUp/PgDn) ", server)
+        format!(" Logs: {} (A/Z=Scroll Shift+Select=Copy) ", server)
     } else {
-        " Logs: All (PgUp/PgDn) ".to_string()
+        " Logs: All (A/Z=Scroll Shift+Select=Copy) ".to_string()
     };
 
     // Use cached logs - NO fetching during render!
-    let visible_height = area.height.saturating_sub(2) as usize;
+    let visible_height = area.height.saturating_sub(2);
+    app.visible_height = visible_height;  // Update for scroll bounds
     let scroll = app.scroll_offset as usize;
 
     let log_lines: Vec<Line> = app.cached_logs
         .iter()
         .skip(scroll)
-        .take(visible_height)
+        .take(visible_height as usize)
         .map(|line| Line::from(Span::raw(line.as_str())))
         .collect();
 

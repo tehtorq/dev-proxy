@@ -284,9 +284,11 @@ struct DevServer {
     process: Option<tokio::process::Child>,
     last_activity: Instant,
     is_starting: bool,
+    is_stopping: bool,  // Prevent restart attempts during shutdown
     detected_port: Option<u16>,
     connection_semaphore: Arc<Semaphore>,
     log_tx: Option<mpsc::UnboundedSender<(String, String)>>,
+    status_store: Option<Arc<tui::LogStore>>,
 }
 
 impl DevServer {
@@ -296,9 +298,11 @@ impl DevServer {
             process: None,
             last_activity: Instant::now(),
             is_starting: false,
+            is_stopping: false,
             detected_port: None,
             connection_semaphore: Arc::new(Semaphore::new(20)), // Max 20 concurrent connections per server
             log_tx: None,
+            status_store: None,
         }
     }
 
@@ -306,8 +310,12 @@ impl DevServer {
         self.log_tx = Some(tx);
     }
 
+    fn set_status_store(&mut self, store: Arc<tui::LogStore>) {
+        self.status_store = Some(store);
+    }
+
     async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.process.is_some() || self.is_starting {
+        if self.process.is_some() || self.is_starting || self.is_stopping {
             return Ok(());
         }
 
@@ -322,10 +330,18 @@ impl DevServer {
         let mut cmd = TokioCommand::new(&self.config.command);
         cmd.args(&self.config.args)
             .current_dir(&self.config.directory)
-            .kill_on_drop(true)
+            .kill_on_drop(false)  // We'll handle shutdown manually
             .stdin(Stdio::null())  // CRITICAL: Prevent child from inheriting/stealing stdin!
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // On Unix, create a new process group so we can kill all children
+        #[cfg(unix)]
+        {
+            #[allow(unused_imports)]
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
 
         let mut child = cmd.spawn()?;
 
@@ -430,15 +446,43 @@ impl DevServer {
             if let Some(tx) = &self.log_tx {
                 let _ = tx.send((self.config.name.clone(), format!("✅ Dev server ready on port {}", port)));
             }
+
+            // Update running status in LogStore
+            if let Some(store) = &self.status_store {
+                store.set_server_running(self.config.name.clone());
+            }
         } else {
             // Port detection failed - kill the child process to prevent resource leak
             if let Some(mut child) = self.process.take() {
-                warn!("Killing dev server process due to port detection failure");
+                warn!("⚠️ [{}] Killing dev server process due to port detection failure", self.config.name);
+
+                // Kill the entire process group
+                #[cfg(unix)]
+                {
+                    if let Some(pid) = child.id() {
+                        unsafe {
+                            libc::kill(-(pid as i32), libc::SIGKILL);
+                        }
+                    }
+                }
+
                 let _ = child.start_kill();
                 let _ = child.wait().await;
             }
             self.is_starting = false;
+            self.detected_port = None;
             error!("❌ [{}] Failed to detect port", self.config.name);
+
+            // Send error to TUI
+            if let Some(tx) = &self.log_tx {
+                let _ = tx.send((self.config.name.clone(), "❌ Failed to detect port - check logs".to_string()));
+            }
+
+            // Update running status in LogStore
+            if let Some(store) = &self.status_store {
+                store.set_server_stopped(self.config.name.clone());
+            }
+
             return Err("Failed to detect port".into());
         }
 
@@ -449,19 +493,83 @@ impl DevServer {
         self.detected_port
     }
 
-    fn stop(&mut self) {
-        if let Some(mut child) = self.process.take() {
-            info!("💤 [{}] Stopping dev server due to inactivity...",
-                  self.config.name);
+    async fn stop_and_wait(&mut self) {
+        // CRITICAL: Set is_stopping flag FIRST to prevent auto-restart during shutdown
+        self.is_stopping = true;
+        self.detected_port = None;
+        self.is_starting = false;
 
+        // Update running status in LogStore IMMEDIATELY
+        if let Some(store) = &self.status_store {
+            store.set_server_stopped(self.config.name.clone());
+        }
+
+        if let Some(mut child) = self.process.take() {
+            info!("💤 [{}] Stopping dev server...", self.config.name);
+
+            // Send status to TUI
+            if let Some(tx) = &self.log_tx {
+                let _ = tx.send((self.config.name.clone(), "💤 Stopping server...".to_string()));
+            }
+
+            // Kill the entire process group with SIGKILL (immediate, no restart handlers)
+            // This prevents npm/pnpm from restarting child processes before dying
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child.id() {
+                    // Kill the entire process group immediately (negative PID)
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
+            }
+
+            // Also kill via tokio
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+
+            // Wait for entire process group to die, ports to be released,
+            // AND for browser to stop reconnecting (WebSocket has exponential backoff)
+            // Browser typically gives up after ~5 seconds of failures
+            sleep(Duration::from_secs(5)).await;
+        }
+
+        // NOW clear is_stopping flag - process group dead, ports released, browser stopped retrying
+        self.is_stopping = false;
+
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.send((self.config.name.clone(), "✅ Shutdown complete (will auto-restart on next request)".to_string()));
+        }
+    }
+
+    fn stop(&mut self) {
+        // Synchronous version for idle checker
+        if let Some(mut child) = self.process.take() {
+            info!("💤 [{}] Stopping dev server due to inactivity...", self.config.name);
             // Send status to TUI
             if let Some(tx) = &self.log_tx {
                 let _ = tx.send((self.config.name.clone(), "💤 Stopping due to inactivity...".to_string()));
             }
 
+            // Kill the entire process group immediately
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child.id() {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
+            }
+
             let _ = child.start_kill();
         }
         self.detected_port = None;
+        self.is_starting = false;
+
+        // Update running status in LogStore
+        if let Some(store) = &self.status_store {
+            store.set_server_stopped(self.config.name.clone());
+        }
     }
 
     fn update_activity(&mut self) {
@@ -529,6 +637,19 @@ where
                 .unwrap());
         }
     };
+
+    // Check if server is stopping FIRST - reject all requests during shutdown
+    {
+        let servers = server_map.lock().await;
+        if let Some(server) = servers.get(&domain) {
+            if server.is_stopping {
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(full_body("Server is shutting down, please wait..."))
+                    .unwrap());
+            }
+        }
+    }
 
     // Update activity and check if we need to start
     {
@@ -786,6 +907,109 @@ where
     }
 }
 
+async fn handle_server_command(command: tui::ServerCommand, server_map: ServerMap) {
+    match command {
+        tui::ServerCommand::Kill(name) => {
+            info!("🛑 [{}] Manual stop requested", name);
+
+            // Set is_stopping flag first, while holding lock briefly
+            {
+                let mut servers = server_map.lock().await;
+                for server in servers.values_mut() {
+                    if server.config.name == name {
+                        server.is_stopping = true;
+                        server.detected_port = None;
+                        server.is_starting = false;
+
+                        // Send notification
+                        if let Some(tx) = &server.log_tx {
+                            let _ = tx.send((name.clone(), "🛑 Killing server...".to_string()));
+                        }
+
+                        // Update status immediately
+                        if let Some(store) = &server.status_store {
+                            store.set_server_stopped(name.clone());
+                        }
+                        break;
+                    }
+                }
+            } // Release lock here
+
+            // Kill the process WITHOUT holding the lock (don't block other servers)
+            {
+                let mut servers = server_map.lock().await;
+                for server in servers.values_mut() {
+                    if server.config.name == name && server.process.is_some() {
+                        if let Some(mut child) = server.process.take() {
+                            #[cfg(unix)]
+                            {
+                                if let Some(pid) = child.id() {
+                                    unsafe {
+                                        libc::kill(-(pid as i32), libc::SIGKILL);
+                                    }
+                                }
+                            }
+                            let _ = child.start_kill();
+
+                            // Release lock while waiting for process death
+                            drop(servers);
+                            let _ = child.wait().await;
+
+                            // Wait for browser to stop retrying (without holding lock)
+                            sleep(Duration::from_secs(5)).await;
+
+                            // Re-acquire lock to clear flags
+                            let mut servers = server_map.lock().await;
+                            if let Some(server) = servers.values_mut().find(|s| s.config.name == name) {
+                                server.is_stopping = false;
+                                if let Some(tx) = &server.log_tx {
+                                    let _ = tx.send((name.clone(), "✅ Shutdown complete (will auto-restart on next request)".to_string()));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        tui::ServerCommand::Restart(name) => {
+            info!("🔄 [{}] Restart requested", name);
+
+            // Find domain first
+            let (domain_to_restart, log_tx) = {
+                let servers = server_map.lock().await;
+                servers.iter()
+                    .find(|(_, s)| s.config.name == name)
+                    .map(|(domain, s)| (domain.clone(), s.log_tx.clone()))
+                    .unwrap_or_default()
+            };
+
+            if !domain_to_restart.is_empty() {
+                // Send notification
+                if let Some(tx) = &log_tx {
+                    let _ = tx.send((name.clone(), "🔄 Restarting...".to_string()));
+                }
+
+                // Stop and wait for process exit and port release
+                {
+                    let mut servers = server_map.lock().await;
+                    if let Some(server) = servers.get_mut(&domain_to_restart) {
+                        server.stop_and_wait().await;  // Already waits 2 seconds internally
+                    }
+                }
+
+                // Restart
+                {
+                    let mut servers = server_map.lock().await;
+                    if let Some(server) = servers.get_mut(&domain_to_restart) {
+                        let _ = server.start().await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn idle_checker(server_map: ServerMap) {
     loop {
         sleep(Duration::from_secs(30)).await;
@@ -806,7 +1030,17 @@ async fn handle_signals(mut signals: Signals, server_map: ServerMap) {
                 info!("Received shutdown signal, stopping all servers...");
                 let mut servers = server_map.lock().await;
                 for server in servers.values_mut() {
-                    server.stop();
+                    if let Some(mut child) = server.process.take() {
+                        #[cfg(unix)]
+                        {
+                            if let Some(pid) = child.id() {
+                                unsafe {
+                                    libc::kill(-(pid as i32), libc::SIGKILL);
+                                }
+                            }
+                        }
+                        let _ = child.start_kill();
+                    }
                 }
                 std::process::exit(0);
             }
@@ -979,6 +1213,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run TUI if enabled, otherwise just wait for Ctrl+C
     if let Some((_tx, log_rx)) = log_rx {
+        // Create shared LogStore for status tracking
+        let log_store = Arc::new(tui::LogStore::new());
+
+        // Set LogStore on all DevServers so they can update status
+        {
+            let mut servers = server_map.lock().await;
+            for server in servers.values_mut() {
+                server.set_status_store(log_store.clone());
+            }
+        }
+
         // Build server info list for TUI
         let server_info: Vec<tui::ServerInfo> = server_configs
             .iter()
@@ -988,13 +1233,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
 
-        let tui_app = tui::TuiApp::new(server_info);
+        let mut tui_app = tui::TuiApp::new(server_info);
+
+        // Create command channel for TUI to send kill/restart commands
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        tui_app.set_command_sender(cmd_tx);
+
+        // Spawn async task to handle TUI commands
+        let cmd_server_map = server_map.clone();
+        tokio::spawn(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                handle_server_command(command, cmd_server_map.clone()).await;
+            }
+        });
 
         // Run TUI in a DEDICATED OS thread (not tokio's blocking pool!)
         // This prevents stdin reads from being starved when tokio runtime is busy
         let (tui_tx, tui_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = tui::run_tui_blocking(tui_app, log_rx);
+            let result = tui::run_tui_blocking(tui_app, log_store, log_rx);
             let _ = tui_tx.send(result);
         });
 
@@ -1019,10 +1276,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Shutdown signal handlers
         handle.close();
 
-        // Stop all servers
+        // Stop all servers and kill process groups
         let mut servers = server_map.lock().await;
         for server in servers.values_mut() {
-            server.stop();
+            if let Some(mut child) = server.process.take() {
+                #[cfg(unix)]
+                {
+                    if let Some(pid) = child.id() {
+                        unsafe {
+                            libc::kill(-(pid as i32), libc::SIGKILL);
+                        }
+                    }
+                }
+                let _ = child.start_kill();
+            }
         }
     } else {
         // Non-TUI mode - keep the main task alive
