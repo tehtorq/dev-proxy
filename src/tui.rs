@@ -1,5 +1,6 @@
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::{
-    backend::TermionBackend,
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -7,13 +8,10 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use termion::event::Key;
-use termion::input::TermRead;
-use termion::raw::IntoRawMode;
 use tokio::sync::mpsc;
 
 const MAX_LINES: usize = 200;
@@ -172,12 +170,14 @@ pub fn run_tui_blocking(
     mut app: TuiApp,
     mut log_rx: mpsc::UnboundedReceiver<(String, String)>,
 ) -> io::Result<()> {
-    // Setup terminal with termion (more reliable than crossterm on macOS)
-    let stdout = io::stdout();
-    let backend = TermionBackend::new(stdout.into_raw_mode()?);
+    // Setup terminal
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::terminal::enable_raw_mode()?;
+
+    let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    write!(terminal.backend_mut(), "{}", termion::screen::ToAlternateScreen)?;
 
     let log_store = Arc::new(LogStore::new());
 
@@ -231,15 +231,19 @@ pub fn run_tui_blocking(
 
     let result = run_app(&mut terminal, &mut app);
 
-    // Exit alternate screen
-    write!(terminal.backend_mut(), "{}", termion::screen::ToMainScreen)?;
-    // Raw mode cleanup happens automatically when RawTerminal drops
+    // Restore terminal
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
 
     result
 }
 
-fn run_app<W: Write>(
-    terminal: &mut Terminal<TermionBackend<W>>,
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
 ) -> io::Result<()> {
     // Initial refresh and draw
@@ -247,17 +251,18 @@ fn run_app<W: Write>(
     terminal.draw(|f| ui(f, app))?;
     app.last_draw_time = Instant::now();
 
-    // Spawn dedicated thread to read keyboard events using termion
-    // Termion reads from stdin directly, avoiding stdin inheritance issues with child processes
+    // Spawn dedicated thread to read keyboard events using crossterm
+    // With child processes having .stdin(Stdio::null()), they won't steal our keypresses
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let _event_thread = std::thread::spawn(move || {
-        use std::io::stdin;
-        let stdin = stdin();
-        for key_result in stdin.keys() {
-            if let Ok(key) = key_result {
-                if event_tx.send(key).is_err() {
-                    break; // Channel closed, exit thread
+        loop {
+            match crossterm::event::read() {
+                Ok(evt) => {
+                    if event_tx.send(evt).is_err() {
+                        break; // Channel closed, exit thread
+                    }
                 }
+                Err(_) => break,
             }
         }
     });
@@ -265,22 +270,25 @@ fn run_app<W: Write>(
     loop {
         // Wait for keyboard event with timeout (for log refresh)
         match event_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(key) => {
-                match key {
-                    Key::Char('q') | Key::Esc | Key::Ctrl('c') => {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
                         return Ok(());
                     }
-                    Key::Down => {
+                    KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
+                    KeyCode::Down => {
                         app.next();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
-                    Key::Up => {
+                    KeyCode::Up => {
                         app.previous();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
-                    Key::Char('\n') => {
+                    KeyCode::Enter => {
                         if let Some(server) = app.get_selected_server_info() {
                             let url = format!("http://{}", server.domain);
                             #[cfg(target_os = "macos")]
@@ -291,28 +299,28 @@ fn run_app<W: Write>(
                             let _ = std::process::Command::new("cmd").args(&["/C", "start", &url]).spawn();
                         }
                     }
-                    Key::PageDown => {
+                    KeyCode::PageDown => {
                         for _ in 0..10 {
                             app.scroll_down();
                         }
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
-                    Key::PageUp => {
+                    KeyCode::PageUp => {
                         for _ in 0..10 {
                             app.scroll_up();
                         }
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
-                    Key::Home => {
+                    KeyCode::Home => {
                         app.selected_index = 0;
                         app.scroll_offset = 0;
                         app.refresh_current_logs();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
-                    Key::End => {
+                    KeyCode::End => {
                         app.selected_index = app.servers.len();
                         app.scroll_offset = 0;
                         app.refresh_current_logs();
@@ -321,6 +329,9 @@ fn run_app<W: Write>(
                     }
                     _ => {}
                 }
+            }
+            Ok(_) => {
+                // Ignore other events (resize, mouse, etc.)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Timeout - check for log updates and redraw if needed
