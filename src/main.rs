@@ -323,6 +323,7 @@ impl DevServer {
         cmd.args(&self.config.args)
             .current_dir(&self.config.directory)
             .kill_on_drop(true)
+            .stdin(Stdio::null())  // CRITICAL: Prevent child from inheriting/stealing stdin!
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -989,14 +990,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let tui_app = tui::TuiApp::new(server_info);
 
-        // Run TUI in a blocking thread (not on async runtime)
-        let tui_handle = tokio::task::spawn_blocking(move || {
-            tui::run_tui_blocking(tui_app, log_rx)
+        // Run TUI in a DEDICATED OS thread (not tokio's blocking pool!)
+        // This prevents stdin reads from being starved when tokio runtime is busy
+        let (tui_tx, tui_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = tui::run_tui_blocking(tui_app, log_rx);
+            let _ = tui_tx.send(result);
         });
 
-        // Wait for TUI to exit
-        if let Err(e) = tui_handle.await {
-            error!("TUI task error: {}", e);
+        // Wait for TUI to exit (use spawn_blocking for the recv to avoid blocking tokio runtime)
+        let tui_result = tokio::task::spawn_blocking(move || tui_rx.recv()).await;
+
+        match tui_result {
+            Ok(Ok(Ok(_))) => {
+                info!("TUI exited cleanly");
+            }
+            Ok(Ok(Err(e))) => {
+                error!("TUI error: {}", e);
+            }
+            Ok(Err(_)) => {
+                error!("TUI thread panicked");
+            }
+            Err(e) => {
+                error!("Failed to join TUI thread: {}", e);
+            }
         }
 
         // Shutdown signal handlers
