@@ -43,6 +43,7 @@ Auto-detects and uses the right one:
 - **WebSocket support** - Hot Module Replacement (HMR) works perfectly
 - **Connection limiting** - Prevents resource exhaustion on heavy loads
 - **Simple CLI** - Easy add/remove/list commands
+- **Optional TUI mode** - Split-panel interface with server list and filtered logs
 
 ## Quick Start
 
@@ -141,6 +142,41 @@ Visit `http://admin.test` in your browser:
 
 Your app loads! HMR works! After 15 minutes of inactivity, it automatically stops.
 
+## TUI Mode
+
+Enable the split-panel terminal interface for better visibility:
+
+```bash
+dev-proxy --ui --domain-suffix teachme2.test
+```
+
+**Interface:**
+```
+┌──────────────────┬─────────────────────────────────┐
+│ Servers          │ Logs: admin                     │
+│                  │                                 │
+│ ◉ All            │ [admin] > npm run dev           │
+│ ● admin.test     │ [admin] VITE ready in 234ms     │
+│   :5176          │ [admin] ➜ http://localhost:5176 │
+│ ○ dashboard.test │ 🔍 Detected port: 5176          │
+│ ● phone.test     │ ✅ Dev server ready on port 5176│
+│   :5174          │                                 │
+└──────────────────┴─────────────────────────────────┘
+```
+
+**Controls:**
+- `↑/↓` - Navigate server list
+- `PgUp/PgDn` - Scroll logs
+- `Home/End` - Jump to first/last server
+- `q` or `Esc` - Quit
+
+**Features:**
+- Live log streaming for selected server
+- Select "All" to see logs from all servers
+- Server status indicators (● running / ○ stopped)
+- Shows port numbers
+- Auto-scrolling logs
+
 ## How It Works
 
 ```
@@ -216,6 +252,9 @@ dev-proxy --port 8080 --domain-suffix dev --dir ~/my-projects
 -s, --domain-suffix <DOMAIN_SUFFIX>
     Domain suffix [default: test]
 
+--ui
+    Enable TUI mode with split-panel interface
+
 -h, --help
     Print help
 
@@ -224,6 +263,20 @@ dev-proxy --port 8080 --domain-suffix dev --dir ~/my-projects
 ```
 
 ## Advanced Usage
+
+### TUI Mode
+
+For a better visual experience, use the terminal UI:
+
+```bash
+# Run with TUI
+dev-proxy --ui
+
+# With custom settings
+dev-proxy --ui --domain-suffix dev --port 8080
+```
+
+Navigate servers with arrow keys, press `q` to quit. Logs are filtered by selected server automatically.
 
 ### Custom Domain Suffix
 

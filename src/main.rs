@@ -1,3 +1,5 @@
+mod tui;
+
 use clap::Parser;
 use futures_util::stream::StreamExt;
 use http_body_util::{BodyExt, Full};
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -49,6 +51,10 @@ struct Args {
     /// Domain suffix (for run command)
     #[arg(short = 's', long, default_value = "test", global = true)]
     domain_suffix: String,
+
+    /// Enable TUI mode with split-panel interface
+    #[arg(long, global = true)]
+    ui: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -115,13 +121,15 @@ fn detect_package_manager(directory: &str) -> std::io::Result<(String, Vec<Strin
     }
 }
 
-fn scan_symlinks_directory(dir_path: &str, domain_suffix: &str) -> std::io::Result<Vec<ServerConfig>> {
+fn scan_symlinks_directory(dir_path: &str, domain_suffix: &str, verbose: bool) -> std::io::Result<Vec<ServerConfig>> {
     let path = std::path::Path::new(dir_path);
 
     if !path.exists() {
         // Create the directory if it doesn't exist
         std::fs::create_dir_all(dir_path)?;
-        info!("Created directory: {}", dir_path);
+        if verbose {
+            info!("Created directory: {}", dir_path);
+        }
         return Ok(Vec::new());
     }
 
@@ -142,16 +150,22 @@ fn scan_symlinks_directory(dir_path: &str, domain_suffix: &str) -> std::io::Resu
 
                     match ServerConfig::new(name.clone(), directory, domain_suffix) {
                         Ok(config) => {
-                            info!("   📌 {} → {}", config.domain, config.directory);
+                            if verbose {
+                                info!("   📌 {} → {}", config.domain, config.directory);
+                            }
                             servers.push(config);
                         }
                         Err(e) => {
-                            warn!("   ⚠️  Skipping {}: {}", name, e);
+                            if verbose {
+                                warn!("   ⚠️  Skipping {}: {}", name, e);
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("   ⚠️  Failed to read symlink {}: {}", name, e);
+                    if verbose {
+                        warn!("   ⚠️  Failed to read symlink {}: {}", name, e);
+                    }
                 }
             }
         }
@@ -272,6 +286,7 @@ struct DevServer {
     is_starting: bool,
     detected_port: Option<u16>,
     connection_semaphore: Arc<Semaphore>,
+    log_tx: Option<mpsc::UnboundedSender<(String, String)>>,
 }
 
 impl DevServer {
@@ -283,7 +298,12 @@ impl DevServer {
             is_starting: false,
             detected_port: None,
             connection_semaphore: Arc::new(Semaphore::new(20)), // Max 20 concurrent connections per server
+            log_tx: None,
         }
+    }
+
+    fn set_log_sender(&mut self, tx: mpsc::UnboundedSender<(String, String)>) {
+        self.log_tx = Some(tx);
     }
 
     async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -293,6 +313,11 @@ impl DevServer {
 
         self.is_starting = true;
         info!("🚀 [{}] Starting dev server (auto-detecting port)...", self.config.name);
+
+        // Send status to TUI
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.send((self.config.name.clone(), "🚀 Starting dev server...".to_string()));
+        }
 
         let mut cmd = TokioCommand::new(&self.config.command);
         cmd.args(&self.config.args)
@@ -305,15 +330,23 @@ impl DevServer {
 
         // Spawn tasks to read stdout and stderr and detect port
         let detected_port = Arc::new(Mutex::new(None::<u16>));
+        let log_tx = self.log_tx.clone();
 
         if let Some(stdout) = child.stdout.take() {
             let detected_port = detected_port.clone();
             let name = self.config.name.clone();
+            let log_tx = log_tx.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    println!("[{}] {}", name, line);
+                    // Send to TUI if enabled
+                    if let Some(tx) = &log_tx {
+                        let _ = tx.send((name.clone(), line.clone()));
+                    } else {
+                        println!("[{}] {}", name, line);
+                    }
+
                     if let Some(caps) = PORT_REGEX.captures(&line) {
                         if let Some(port_str) = caps.get(1) {
                             if let Ok(port) = port_str.as_str().parse::<u16>() {
@@ -321,6 +354,10 @@ impl DevServer {
                                 if detected.is_none() {
                                     *detected = Some(port);
                                     info!("🔍 [{}] Detected port: {}", name, port);
+                                    // Also send to TUI
+                                    if let Some(tx) = &log_tx {
+                                        let _ = tx.send((name.clone(), format!("🔍 Detected port: {}", port)));
+                                    }
                                 }
                             }
                         }
@@ -332,11 +369,18 @@ impl DevServer {
         if let Some(stderr) = child.stderr.take() {
             let detected_port = detected_port.clone();
             let name = self.config.name.clone();
+            let log_tx = log_tx.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    eprintln!("[{}] {}", name, line);
+                    // Send to TUI if enabled
+                    if let Some(tx) = &log_tx {
+                        let _ = tx.send((name.clone(), line.clone()));
+                    } else {
+                        eprintln!("[{}] {}", name, line);
+                    }
+
                     if let Some(caps) = PORT_REGEX.captures(&line) {
                         if let Some(port_str) = caps.get(1) {
                             if let Ok(port) = port_str.as_str().parse::<u16>() {
@@ -344,6 +388,10 @@ impl DevServer {
                                 if detected.is_none() {
                                     *detected = Some(port);
                                     info!("🔍 [{}] Detected port: {}", name, port);
+                                    // Also send to TUI
+                                    if let Some(tx) = &log_tx {
+                                        let _ = tx.send((name.clone(), format!("🔍 Detected port: {}", port)));
+                                    }
                                 }
                             }
                         }
@@ -376,6 +424,11 @@ impl DevServer {
             sleep(Duration::from_millis(500)).await;
             self.is_starting = false;
             info!("✅ [{}] Dev server ready on port {}", self.config.name, port);
+
+            // Send status to TUI
+            if let Some(tx) = &self.log_tx {
+                let _ = tx.send((self.config.name.clone(), format!("✅ Dev server ready on port {}", port)));
+            }
         } else {
             // Port detection failed - kill the child process to prevent resource leak
             if let Some(mut child) = self.process.take() {
@@ -399,6 +452,12 @@ impl DevServer {
         if let Some(mut child) = self.process.take() {
             info!("💤 [{}] Stopping dev server due to inactivity...",
                   self.config.name);
+
+            // Send status to TUI
+            if let Some(tx) = &self.log_tx {
+                let _ = tx.send((self.config.name.clone(), "💤 Stopping due to inactivity...".to_string()));
+            }
+
             let _ = child.start_kill();
         }
         self.detected_port = None;
@@ -833,36 +892,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // From here on, we're running the proxy server
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("dev_proxy=info"))
-        )
-        .init();
+    // Only enable logging if not in TUI mode (TUI captures logs differently)
+    if !args.ui {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("dev_proxy=info"))
+            )
+            .init();
+    }
 
-    info!("🔍 Scanning {} for dev servers...", symlinks_dir);
+    if !args.ui {
+        info!("🔍 Scanning {} for dev servers...", symlinks_dir);
+    }
 
     // Scan for symlinks
-    let server_configs = scan_symlinks_directory(&symlinks_dir, &args.domain_suffix)?;
+    let server_configs = scan_symlinks_directory(&symlinks_dir, &args.domain_suffix, !args.ui)?;
 
     if server_configs.is_empty() {
-        error!("No servers found in {}", symlinks_dir);
-        error!("Add a server with: dev-proxy add <name> <path>");
-        error!("Example: dev-proxy add myapp ~/code/myapp");
+        if args.ui {
+            eprintln!("No servers found in {}", symlinks_dir);
+            eprintln!("Add a server with: dev-proxy add <name> <path>");
+            eprintln!("Example: dev-proxy add myapp ~/code/myapp");
+        } else {
+            error!("No servers found in {}", symlinks_dir);
+            error!("Add a server with: dev-proxy add <name> <path>");
+            error!("Example: dev-proxy add myapp ~/code/myapp");
+        }
         std::process::exit(1);
     }
 
-    info!("🎯 DevProxy starting with {} servers on port {}", server_configs.len(), args.port);
+    if !args.ui {
+        info!("🎯 DevProxy starting with {} servers on port {}", server_configs.len(), args.port);
+    }
+
+    // Initialize log collector if TUI mode is enabled
+    let log_rx = if args.ui {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Some((tx, rx))
+    } else {
+        None
+    };
 
     // Initialize server map
     let server_map: ServerMap = Arc::new(Mutex::new(HashMap::new()));
 
     {
         let mut servers = server_map.lock().await;
-        for server_config in server_configs {
+        for server_config in server_configs.clone() {
+            let mut dev_server = DevServer::new(server_config.clone());
+
+            // Set log sender if TUI mode is enabled
+            if let Some((ref tx, _)) = log_rx {
+                dev_server.set_log_sender(tx.clone());
+            }
+
             servers.insert(
                 server_config.domain.clone(),
-                DevServer::new(server_config),
+                dev_server,
             );
         }
     }
@@ -885,11 +972,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle_signals(signals, signal_map).await;
     });
 
-    info!("✨ DevProxy ready! Press Ctrl+C to stop.");
+    if !args.ui {
+        info!("✨ DevProxy ready! Press Ctrl+C to stop.");
+    }
 
-    // Keep the main task alive
-    tokio::signal::ctrl_c().await?;
-    handle.close();
+    // Run TUI if enabled, otherwise just wait for Ctrl+C
+    if let Some((_tx, log_rx)) = log_rx {
+        // Build server info list for TUI
+        let server_info: Vec<tui::ServerInfo> = server_configs
+            .iter()
+            .map(|config| tui::ServerInfo {
+                name: config.name.clone(),
+                domain: config.domain.clone(),
+            })
+            .collect();
+
+        let tui_app = tui::TuiApp::new(server_info);
+
+        // Run TUI in a blocking thread (not on async runtime)
+        let tui_handle = tokio::task::spawn_blocking(move || {
+            tui::run_tui_blocking(tui_app, log_rx)
+        });
+
+        // Wait for TUI to exit
+        if let Err(e) = tui_handle.await {
+            error!("TUI task error: {}", e);
+        }
+
+        // Shutdown signal handlers
+        handle.close();
+
+        // Stop all servers
+        let mut servers = server_map.lock().await;
+        for server in servers.values_mut() {
+            server.stop();
+        }
+    } else {
+        // Non-TUI mode - keep the main task alive
+        tokio::signal::ctrl_c().await?;
+        handle.close();
+    }
 
     Ok(())
 }
