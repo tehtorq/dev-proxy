@@ -43,19 +43,63 @@ Auto-detects and uses the right one:
 - **WebSocket support** - Hot Module Replacement (HMR) works perfectly
 - **Connection limiting** - Prevents resource exhaustion on heavy loads
 - **Simple CLI** - Easy add/remove/list commands
-- **Optional TUI mode** - Split-panel interface with server list and filtered logs
+- **Split-panel TUI** - Visual interface with server status, logs, and control (default!)
+- **Process group management** - Clean shutdown with no orphaned processes
 
-## Quick Start
+## Installation
 
-### Installation
+### macOS
 
 ```bash
 # Clone and build
 git clone <this-repo>
 cd dev-proxy
 cargo build --release
+
+# Install to system PATH
 sudo cp target/release/dev-proxy /usr/local/bin/
+
+# Verify installation
+which dev-proxy
+# Should output: /usr/local/bin/dev-proxy
+
+# You can now run dev-proxy from any terminal
+dev-proxy
 ```
+
+### Linux
+
+```bash
+# Clone and build
+git clone <this-repo>
+cd dev-proxy
+cargo build --release
+
+# Option 1: System-wide install (requires sudo)
+sudo cp target/release/dev-proxy /usr/local/bin/
+
+# Option 2: User-only install (no sudo required)
+mkdir -p ~/.local/bin
+cp target/release/dev-proxy ~/.local/bin/
+# Add to PATH: export PATH="$HOME/.local/bin:$PATH" in ~/.bashrc or ~/.zshrc
+
+# Verify
+dev-proxy --version
+```
+
+**Note:** On Linux, you may need to install build dependencies first:
+```bash
+# Debian/Ubuntu
+sudo apt-get install build-essential pkg-config libssl-dev
+
+# Fedora/RHEL
+sudo dnf install gcc openssl-devel
+
+# Arch
+sudo pacman -S base-devel openssl
+```
+
+## Quick Start
 
 ### Setup Your Apps
 
@@ -142,40 +186,61 @@ Visit `http://admin.test` in your browser:
 
 Your app loads! HMR works! After 15 minutes of inactivity, it automatically stops.
 
-## TUI Mode
+## TUI Mode (Default)
 
-Enable the split-panel terminal interface for better visibility:
+dev-proxy now starts with a split-panel terminal interface by default:
 
 ```bash
-dev-proxy --ui --domain-suffix teachme2.test
+# Run with TUI (default)
+dev-proxy
+
+# Or disable TUI for plain logging
+dev-proxy --no-ui
 ```
 
 **Interface:**
 ```
-┌──────────────────┬─────────────────────────────────┐
-│ Servers          │ Logs: admin                     │
-│                  │                                 │
-│ ◉ All            │ [admin] > npm run dev           │
-│ ● admin.test     │ [admin] VITE ready in 234ms     │
-│   :5176          │ [admin] ➜ http://localhost:5176 │
-│ ○ dashboard.test │ 🔍 Detected port: 5176          │
-│ ● phone.test     │ ✅ Dev server ready on port 5176│
-│   :5174          │                                 │
-└──────────────────┴─────────────────────────────────┘
+┌────────────────────────────────────┬─────────────────────────────────┐
+│ Servers                            │ Logs: admin                     │
+│ (↑↓=Nav Enter=Open k=Kill r=Res..│ (c=Copy f=Flush A/Z=Scroll...)  │
+│                                    │                                 │
+│ ◉ All                              │ [admin] > npm run dev           │
+│ ● admin.test                       │ [admin] VITE ready in 234ms     │
+│ ○ dashboard.test                   │ [admin] ➜ http://localhost:5176 │
+│ ● phone.test                       │ 🔍 Detected port: 5176          │
+│                                    │ ✅ Dev server ready on port 5176│
+└────────────────────────────────────┴─────────────────────────────────┘
 ```
 
-**Controls:**
-- `↑/↓` - Navigate server list
-- `PgUp/PgDn` - Scroll logs
-- `Home/End` - Jump to first/last server
-- `q` or `Esc` - Quit
+### Navigation
 
-**Features:**
-- Live log streaming for selected server
-- Select "All" to see logs from all servers
-- Server status indicators (● running / ○ stopped)
-- Shows port numbers
-- Auto-scrolling logs
+**Server List (Left Panel):**
+- `↑/↓` - Navigate servers
+- `Enter` - Open selected server in browser
+- `Home/End` - Jump to first/last server
+
+**Server Control:**
+- `k` - Kill selected server (stops until manually restarted or browser visit)
+- `r` - Restart selected server
+- `q` or `Esc` - Quit dev-proxy
+
+**Log Viewing (Right Panel):**
+- `A/Z` - Scroll logs up/down (5 lines at a time)
+- `T` - Jump to top of logs
+- `B` - Jump to bottom of logs
+- `c` - Copy all logs to clipboard
+- `f` - Flush/clear logs for selected server
+- **Mouse wheel** - Scroll logs
+- **Shift + drag** - Select text to copy (in most terminals)
+
+### Features
+
+- **Live log streaming** - See logs for selected server in real-time
+- **Status indicators** - ● green (running) / ○ gray (stopped)
+- **Auto-scroll** - Logs follow new output when scrolled to bottom
+- **Scrollbars** - Visual indicator of log position
+- **Multi-server view** - Select "All" to see logs from all servers
+- **Clean shutdown** - Kills entire process groups (no orphaned processes)
 
 ## How It Works
 
@@ -252,8 +317,8 @@ dev-proxy --port 8080 --domain-suffix dev --dir ~/my-projects
 -s, --domain-suffix <DOMAIN_SUFFIX>
     Domain suffix [default: test]
 
---ui
-    Enable TUI mode with split-panel interface
+--no-ui
+    Disable TUI mode (use plain logging instead)
 
 -h, --help
     Print help
@@ -264,19 +329,19 @@ dev-proxy --port 8080 --domain-suffix dev --dir ~/my-projects
 
 ## Advanced Usage
 
-### TUI Mode
+### Plain Logging Mode
 
-For a better visual experience, use the terminal UI:
+If you prefer traditional log output without the TUI:
 
 ```bash
-# Run with TUI
-dev-proxy --ui
+# Disable TUI
+dev-proxy --no-ui
 
 # With custom settings
-dev-proxy --ui --domain-suffix dev --port 8080
+dev-proxy --no-ui --domain-suffix dev --port 8080
 ```
 
-Navigate servers with arrow keys, press `q` to quit. Logs are filtered by selected server automatically.
+Logs will be printed directly to stdout/stderr instead of the split-panel interface.
 
 ### Custom Domain Suffix
 
@@ -322,6 +387,7 @@ Create `~/Library/LaunchAgents/com.devproxy.plist`:
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/dev-proxy</string>
+        <string>--no-ui</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -351,7 +417,7 @@ Create `~/.config/systemd/user/devproxy.service`:
 Description=DevProxy - On-demand development server proxy
 
 [Service]
-ExecStart=/usr/local/bin/dev-proxy
+ExecStart=/usr/local/bin/dev-proxy --no-ui
 Restart=always
 
 [Install]
@@ -406,7 +472,7 @@ Most modern dev servers (Vite, Next.js, etc.) output this automatically.
 
 ### Server not starting
 
-Check the dev-proxy output - it shows your dev server's logs:
+In the TUI, select the server in the left panel to view its logs in the right panel. You'll see your dev server's output:
 
 ```
 [admin] > vite
@@ -415,6 +481,21 @@ Check the dev-proxy output - it shows your dev server's logs:
 ```
 
 If you see errors here, they're from your dev server, not dev-proxy.
+
+### Port already in use
+
+If dev-proxy won't start and shows "Address already in use":
+
+```bash
+# Check if another instance is running
+ps aux | grep dev-proxy
+
+# Kill it if needed
+killall dev-proxy
+
+# Or use a different port
+dev-proxy --port 8080
+```
 
 ### Connection issues on first load
 
@@ -449,25 +530,32 @@ Then dev-proxy is for you. It brings the puma-dev workflow to the Node.js ecosys
 ## Example Workflow
 
 ```bash
-# Monday morning - start working on admin panel
-# Just browse to http://admin.test
-# → dev-proxy starts it automatically
+# Monday morning - start dev-proxy
+dev-proxy
+# → Opens TUI with all your configured servers
 
-# Switch to dashboard
-# Browse to http://dashboard.test
-# → dev-proxy starts it automatically
-# → admin.test still running
+# Navigate to admin with ↑/↓, press Enter to open in browser
+# → dev-proxy auto-starts the server
+# → Watch logs in real-time in the TUI
+
+# Switch to dashboard - press ↓ to navigate, Enter to open
+# → Starts automatically
+# → Both servers now running (green ● indicators)
+
+# Check what's happening - select "All" to see logs from all servers
+# Or select individual servers to see filtered logs
+
+# Need to restart a server? Press 'k' to kill, 'r' to restart
+# Logs getting cluttered? Press 'f' to flush them
 
 # Lunch break - 15 minutes later
-# → Both servers auto-stopped
+# → Both servers auto-stopped (gray ○ indicators)
 
-# Afternoon - back to admin
-# Browse to http://admin.test
-# → Starts again automatically
+# Afternoon - browse to admin again
+# → Auto-starts, you see the startup logs in real-time
 
-# End of day - stop dev-proxy
-Ctrl+C
-# → All dev servers gracefully stopped
+# End of day - press 'q' in the TUI
+# → All dev servers gracefully stopped, process groups cleaned up
 ```
 
 ## Contributing
