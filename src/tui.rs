@@ -440,6 +440,25 @@ fn run_app(
                             app.last_draw_time = Instant::now();
                         }
                     }
+                    KeyCode::Char('c') => {
+                        // Copy logs to clipboard
+                        let logs_text = app.cached_logs.join("\n");
+                        match arboard::Clipboard::new() {
+                            Ok(mut clipboard) => {
+                                if clipboard.set_text(&logs_text).is_ok() {
+                                    // Flash a message in the logs
+                                    if let Some(server_name) = app.get_selected_server() {
+                                        app.log_store.add_line(server_name.to_string(), "📋 Copied to clipboard!".to_string());
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(server_name) = app.get_selected_server() {
+                                    app.log_store.add_line(server_name.to_string(), "❌ Failed to access clipboard".to_string());
+                                }
+                            }
+                        }
+                    }
                     KeyCode::Home => {
                         app.selected_index = 0;
                         app.refresh_current_logs();
@@ -552,9 +571,9 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
     let selected_server = app.get_selected_server();
 
     let title = if let Some(server) = selected_server {
-        format!(" Logs: {} (f=Flush A/Z=Scroll T/B=Top/Bottom) ", server)
+        format!(" Logs: {} (c=Copy f=Flush A/Z=Scroll T/B=Top/Bottom) ", server)
     } else {
-        " Logs: All (A/Z=Scroll T/B=Top/Bottom) ".to_string()
+        " Logs: All (c=Copy A/Z=Scroll T/B=Top/Bottom) ".to_string()
     };
 
     // Use cached logs - NO fetching during render!
