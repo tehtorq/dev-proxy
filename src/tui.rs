@@ -165,16 +165,23 @@ impl TuiApp {
         if self.selected_index < self.servers.len() {
             self.selected_index += 1;
         }
-        self.scroll_offset = 0;
         self.refresh_current_logs();
+        // Scroll to bottom to see most recent logs
+        self.scroll_to_bottom();
     }
 
     pub fn previous(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
         }
-        self.scroll_offset = 0;
         self.refresh_current_logs();
+        // Scroll to bottom to see most recent logs
+        self.scroll_to_bottom();
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        let total_lines = self.cached_logs.len() as u16;
+        self.scroll_offset = total_lines.saturating_sub(self.visible_height);
     }
 
     pub fn scroll_down(&mut self) {
@@ -376,15 +383,15 @@ fn run_app(
                     }
                     KeyCode::Home => {
                         app.selected_index = 0;
-                        app.scroll_offset = 0;
                         app.refresh_current_logs();
+                        app.scroll_to_bottom();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
                     KeyCode::End => {
                         app.selected_index = app.servers.len();
-                        app.scroll_offset = 0;
                         app.refresh_current_logs();
+                        app.scroll_to_bottom();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
