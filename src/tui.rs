@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-const MAX_LINES: usize = 200;
+const MAX_LINES: usize = 1000;  // Keep more history per server
 
 #[derive(Debug, Clone)]
 pub enum ServerCommand {
@@ -177,12 +177,24 @@ impl TuiApp {
     }
 
     pub fn refresh_current_logs(&mut self) {
+        // Check if we're at the bottom before refreshing
+        let was_at_bottom = {
+            let total_lines = self.cached_logs.len() as u16;
+            let max_scroll = total_lines.saturating_sub(self.visible_height);
+            self.scroll_offset >= max_scroll
+        };
+
         let selected = self.get_selected_server();
         self.cached_logs = self.log_store.get_lines(selected);
         self.cached_active_servers = self.log_store.get_active_servers_snapshot();
 
         // Get running status directly from LogStore (no log parsing!)
         self.running_servers = self.log_store.get_running_servers_snapshot();
+
+        // Auto-scroll: if we were at the bottom, stay at the bottom as logs are added
+        if was_at_bottom {
+            self.scroll_to_bottom();
+        }
 
         self.last_version = self.log_store.get_version();
     }
