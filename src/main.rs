@@ -52,9 +52,9 @@ struct Args {
     #[arg(short = 's', long, default_value = "test", global = true)]
     domain_suffix: String,
 
-    /// Enable TUI mode with split-panel interface
+    /// Disable TUI mode (use plain logging instead)
     #[arg(long, global = true)]
-    ui: bool,
+    no_ui: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -1128,7 +1128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // From here on, we're running the proxy server
     // Only enable logging if not in TUI mode (TUI captures logs differently)
-    if !args.ui {
+    if args.no_ui {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1137,32 +1137,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    if !args.ui {
+    if args.no_ui {
         info!("🔍 Scanning {} for dev servers...", symlinks_dir);
     }
 
     // Scan for symlinks
-    let server_configs = scan_symlinks_directory(&symlinks_dir, &args.domain_suffix, !args.ui)?;
+    let server_configs = scan_symlinks_directory(&symlinks_dir, &args.domain_suffix, args.no_ui)?;
 
     if server_configs.is_empty() {
-        if args.ui {
-            eprintln!("No servers found in {}", symlinks_dir);
-            eprintln!("Add a server with: dev-proxy add <name> <path>");
-            eprintln!("Example: dev-proxy add myapp ~/code/myapp");
-        } else {
+        if args.no_ui {
             error!("No servers found in {}", symlinks_dir);
             error!("Add a server with: dev-proxy add <name> <path>");
             error!("Example: dev-proxy add myapp ~/code/myapp");
+        } else {
+            eprintln!("No servers found in {}", symlinks_dir);
+            eprintln!("Add a server with: dev-proxy add <name> <path>");
+            eprintln!("Example: dev-proxy add myapp ~/code/myapp");
         }
         std::process::exit(1);
     }
 
-    if !args.ui {
+    if args.no_ui {
         info!("🎯 DevProxy starting with {} servers on port {}", server_configs.len(), args.port);
     }
 
-    // Initialize log collector if TUI mode is enabled
-    let log_rx = if args.ui {
+    // Initialize log collector if TUI mode is enabled (default)
+    let log_rx = if !args.no_ui {
         let (tx, rx) = mpsc::unbounded_channel();
         Some((tx, rx))
     } else {
@@ -1207,7 +1207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle_signals(signals, signal_map).await;
     });
 
-    if !args.ui {
+    if args.no_ui {
         info!("✨ DevProxy ready! Press Ctrl+C to stop.");
     }
 
