@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame, Terminal,
 };
 use std::collections::{HashMap, HashSet};
@@ -103,6 +103,32 @@ impl LogStore {
 
     pub fn get_running_servers_snapshot(&self) -> HashSet<String> {
         self.running_servers.lock().unwrap().clone()
+    }
+
+    pub fn clear_logs(&self, server_name: &str) {
+        // Clear logs for specific server
+        let mut servers = self.servers.lock().unwrap();
+        if let Some(logs) = servers.get_mut(server_name) {
+            logs.clear();
+        }
+        drop(servers);
+
+        // Also clear from "All" cache - just rebuild it
+        let servers = self.servers.lock().unwrap();
+        let mut all = Vec::new();
+        for (name, lines) in servers.iter() {
+            for line in lines {
+                all.push(format!("[{}] {}", name, line));
+            }
+        }
+        drop(servers);
+
+        let mut cache = self.all_logs_cache.lock().unwrap();
+        *cache = all;
+        drop(cache);
+
+        // Increment version to trigger UI update
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -354,16 +380,28 @@ fn run_app(
                         }
                     }
                     KeyCode::Char('z') | KeyCode::Char('Z') => {
-                        for _ in 0..10 {
+                        for _ in 0..5 {
                             app.scroll_down();
                         }
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
-                        for _ in 0..10 {
+                        for _ in 0..5 {
                             app.scroll_up();
                         }
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        // Jump to top of logs
+                        app.scroll_offset = 0;
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        // Jump to bottom of logs
+                        app.scroll_to_bottom();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
@@ -379,6 +417,15 @@ fn run_app(
                             if let Some(ref tx) = app.command_tx {
                                 let _ = tx.send(ServerCommand::Restart(server.name.clone()));
                             }
+                        }
+                    }
+                    KeyCode::Char('f') => {
+                        if let Some(server_name) = app.get_selected_server() {
+                            app.log_store.clear_logs(server_name);
+                            app.refresh_current_logs();
+                            app.scroll_to_bottom();
+                            terminal.draw(|f| ui(f, app))?;
+                            app.last_draw_time = Instant::now();
                         }
                     }
                     KeyCode::Home => {
@@ -493,9 +540,9 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
     let selected_server = app.get_selected_server();
 
     let title = if let Some(server) = selected_server {
-        format!(" Logs: {} (A/Z=Scroll Shift+Select=Copy) ", server)
+        format!(" Logs: {} (f=Flush A/Z=Scroll T/B=Top/Bottom) ", server)
     } else {
-        " Logs: All (A/Z=Scroll Shift+Select=Copy) ".to_string()
+        " Logs: All (A/Z=Scroll T/B=Top/Bottom) ".to_string()
     };
 
     // Use cached logs - NO fetching during render!
@@ -519,4 +566,21 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
         );
 
     f.render_widget(paragraph, area);
+
+    // Only show scrollbar if content doesn't fit on screen
+    let total_lines = app.cached_logs.len();
+    if total_lines > visible_height as usize {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+
+        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_height as usize))
+            .position(app.scroll_offset as usize);
+
+        f.render_stateful_widget(
+            scrollbar,
+            area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 0 }),
+            &mut scrollbar_state,
+        );
+    }
 }
