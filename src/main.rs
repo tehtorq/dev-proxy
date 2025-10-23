@@ -1190,7 +1190,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start single proxy server
-    start_proxy_server(args.port, server_map.clone()).await?;
+    if let Err(e) = start_proxy_server(args.port, server_map.clone()).await {
+        if args.no_ui {
+            error!("Failed to start proxy server: {}", e);
+            if e.to_string().contains("Address already in use") {
+                error!("❌ Port {} is already in use", args.port);
+                error!("   Is dev-proxy already running? Check with: ps aux | grep dev-proxy");
+                error!("   Or use a different port: dev-proxy --port <PORT>");
+            }
+        } else {
+            eprintln!("Failed to start proxy server: {}", e);
+            if e.to_string().contains("Address already in use") {
+                eprintln!("❌ Port {} is already in use", args.port);
+                eprintln!("   Is dev-proxy already running? Check with: ps aux | grep dev-proxy");
+                eprintln!("   Or use a different port: dev-proxy --port <PORT>");
+            }
+        }
+        std::process::exit(1);
+    }
 
     // Start idle checker
     let checker_map = server_map.clone();
