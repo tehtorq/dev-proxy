@@ -542,16 +542,30 @@ impl DevServer {
         }
     }
 
-    fn stop(&mut self) {
-        // Synchronous version for idle checker
-        if let Some(mut child) = self.process.take() {
-            info!("💤 [{}] Stopping dev server due to inactivity...", self.config.name);
-            // Send status to TUI
-            if let Some(tx) = &self.log_tx {
-                let _ = tx.send((self.config.name.clone(), "💤 Stopping due to inactivity...".to_string()));
-            }
+    fn mark_for_stop(&mut self) {
+        // First phase: Set flags to prevent restart during shutdown
+        self.is_stopping = true;
+        self.detected_port = None;
+        self.is_starting = false;
 
-            // Kill the entire process group immediately
+        info!("💤 [{}] Stopping dev server due to inactivity...", self.config.name);
+
+        // Send status to TUI
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.send((self.config.name.clone(), "💤 Stopping due to inactivity...".to_string()));
+        }
+
+        // Update running status in LogStore IMMEDIATELY
+        if let Some(store) = &self.status_store {
+            store.set_server_stopped(self.config.name.clone());
+        }
+    }
+
+    async fn complete_stop(&mut self) {
+        // Second phase: Actually kill the process (called without holding server_map lock)
+        if let Some(mut child) = self.process.take() {
+            // Kill the entire process group immediately with SIGKILL
+            // This prevents npm/pnpm from restarting child processes before dying
             #[cfg(unix)]
             {
                 if let Some(pid) = child.id() {
@@ -562,13 +576,18 @@ impl DevServer {
             }
 
             let _ = child.start_kill();
-        }
-        self.detected_port = None;
-        self.is_starting = false;
+            let _ = child.wait().await;
 
-        // Update running status in LogStore
-        if let Some(store) = &self.status_store {
-            store.set_server_stopped(self.config.name.clone());
+            // Wait for entire process group to die, ports to be released,
+            // AND for browser to stop reconnecting (WebSocket has exponential backoff)
+            sleep(Duration::from_secs(5)).await;
+        }
+
+        // Clear is_stopping flag - process group dead, ports released, browser stopped retrying
+        self.is_stopping = false;
+
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.send((self.config.name.clone(), "✅ Shutdown complete (will auto-restart on next request)".to_string()));
         }
     }
 
@@ -1014,10 +1033,40 @@ async fn idle_checker(server_map: ServerMap) {
     loop {
         sleep(Duration::from_secs(30)).await;
 
-        let mut servers = server_map.lock().await;
-        for server in servers.values_mut() {
-            if server.should_stop() {
-                server.stop();
+        // Phase 1: Identify servers to stop and mark them (holding lock briefly)
+        let servers_to_stop: Vec<String> = {
+            let mut servers = server_map.lock().await;
+            let mut to_stop = Vec::new();
+            for (domain, server) in servers.iter_mut() {
+                if server.should_stop() {
+                    server.mark_for_stop();
+                    to_stop.push(domain.clone());
+                }
+            }
+            to_stop
+        }; // Lock released here
+
+        // Phase 2: Complete the stop for each server (without holding lock)
+        for domain in servers_to_stop {
+            let mut servers = server_map.lock().await;
+            if let Some(server) = servers.get_mut(&domain) {
+                // Take ownership temporarily to avoid holding lock during async operations
+                let mut temp_server = std::mem::replace(
+                    server,
+                    DevServer::new(server.config.clone())
+                );
+
+                // Release lock while waiting
+                drop(servers);
+
+                // Complete the stop (kills process, waits 5 seconds)
+                temp_server.complete_stop().await;
+
+                // Put it back
+                let mut servers = server_map.lock().await;
+                if let Some(server) = servers.get_mut(&domain) {
+                    *server = temp_server;
+                }
             }
         }
     }

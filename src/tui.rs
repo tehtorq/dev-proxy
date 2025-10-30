@@ -137,6 +137,12 @@ pub struct ServerInfo {
     pub domain: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    ServerList,
+    LogsView,
+}
+
 pub struct TuiApp {
     servers: Vec<ServerInfo>,
     selected_index: usize,
@@ -149,6 +155,11 @@ pub struct TuiApp {
     last_version: u64,
     last_draw_time: Instant,
     command_tx: Option<mpsc::UnboundedSender<ServerCommand>>,
+    view_mode: ViewMode,
+    // Text selection state (for logs view)
+    cursor_line: usize,     // Current line position in logs view
+    selection_start: Option<usize>,  // Start line of selection (None = no selection)
+    selection_end: Option<usize>,    // End line of selection
 }
 
 impl TuiApp {
@@ -165,6 +176,10 @@ impl TuiApp {
             last_version: 0,
             last_draw_time: Instant::now(),
             command_tx: None,
+            view_mode: ViewMode::ServerList,
+            cursor_line: 0,
+            selection_start: None,
+            selection_end: None,
         }
     }
 
@@ -250,6 +265,102 @@ impl TuiApp {
             None
         } else {
             self.servers.get(self.selected_index - 1)
+        }
+    }
+
+    pub fn enter_logs_view(&mut self) {
+        self.view_mode = ViewMode::LogsView;
+        // Reset cursor and selection when entering logs view
+        self.cursor_line = 0;
+        self.selection_start = None;
+        self.selection_end = None;
+        // Ensure cursor is within bounds
+        if !self.cached_logs.is_empty() {
+            self.cursor_line = 0;
+        }
+    }
+
+    pub fn exit_logs_view(&mut self) {
+        self.view_mode = ViewMode::ServerList;
+        self.selection_start = None;
+        self.selection_end = None;
+    }
+
+    pub fn move_cursor_up(&mut self) {
+        if self.cursor_line > 0 {
+            self.cursor_line -= 1;
+            // Auto-scroll to keep cursor visible
+            if self.cursor_line < self.scroll_offset as usize {
+                self.scroll_offset = self.cursor_line as u16;
+            }
+        }
+    }
+
+    pub fn move_cursor_down(&mut self) {
+        if self.cursor_line < self.cached_logs.len().saturating_sub(1) {
+            self.cursor_line += 1;
+            // Auto-scroll to keep cursor visible
+            let bottom_visible = self.scroll_offset as usize + self.visible_height as usize;
+            if self.cursor_line >= bottom_visible {
+                self.scroll_offset = (self.cursor_line as u16).saturating_sub(self.visible_height - 1);
+            }
+        }
+    }
+
+    pub fn toggle_selection(&mut self) {
+        match self.selection_start {
+            None => {
+                // Start new selection
+                self.selection_start = Some(self.cursor_line);
+                self.selection_end = Some(self.cursor_line);
+            }
+            Some(start) => {
+                // End selection and copy to clipboard
+                let end = self.cursor_line;
+                let (from, to) = if start <= end {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+
+                // Get selected text
+                let selected_lines: Vec<String> = self.cached_logs
+                    .iter()
+                    .skip(from)
+                    .take(to - from + 1)
+                    .cloned()
+                    .collect();
+
+                let selected_text = selected_lines.join("\n");
+
+                // Copy to clipboard
+                match arboard::Clipboard::new() {
+                    Ok(mut clipboard) => {
+                        if clipboard.set_text(&selected_text).is_ok() {
+                            // Flash a message in the logs
+                            if let Some(server_name) = self.get_selected_server() {
+                                self.log_store.add_line(server_name.to_string(), format!("📋 Copied {} lines to clipboard!", to - from + 1));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(server_name) = self.get_selected_server() {
+                            self.log_store.add_line(server_name.to_string(), "❌ Failed to access clipboard".to_string());
+                        }
+                    }
+                }
+
+                // Clear selection
+                self.selection_start = None;
+                self.selection_end = None;
+            }
+        }
+    }
+
+    pub fn update_selection(&mut self) {
+        // Update selection end as cursor moves (if selection is active)
+        if self.selection_start.is_some() {
+            self.selection_end = Some(self.cursor_line);
         }
     }
 }
@@ -370,13 +481,43 @@ fn run_app(
                     KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
-                    KeyCode::Down => {
+                    KeyCode::Right if app.view_mode == ViewMode::ServerList => {
+                        // Enter logs view
+                        app.enter_logs_view();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Left if app.view_mode == ViewMode::LogsView => {
+                        // Exit logs view, return to server list
+                        app.exit_logs_view();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Down if app.view_mode == ViewMode::ServerList => {
                         app.next();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
-                    KeyCode::Up => {
+                    KeyCode::Up if app.view_mode == ViewMode::ServerList => {
                         app.previous();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Down if app.view_mode == ViewMode::LogsView => {
+                        app.move_cursor_down();
+                        app.update_selection();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Up if app.view_mode == ViewMode::LogsView => {
+                        app.move_cursor_up();
+                        app.update_selection();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Char(' ') if app.view_mode == ViewMode::LogsView => {
+                        // Toggle selection
+                        app.toggle_selection();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
@@ -550,9 +691,13 @@ fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Servers (↑↓=Nav Enter=Open k=Kill r=Restart q=Quit) ")
+                .title(" Servers (↑↓=Nav →=Logs Enter=Open k=Kill r=Restart q=Quit) ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(if app.view_mode == ViewMode::ServerList {
+                    Style::default().fg(Color::Yellow)  // Highlight when focused
+                } else {
+                    Style::default().fg(Color::Cyan)
+                }),
         )
         .highlight_style(
             Style::default()
@@ -570,10 +715,18 @@ fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) 
 fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
     let selected_server = app.get_selected_server();
 
-    let title = if let Some(server) = selected_server {
-        format!(" Logs: {} (c=Copy f=Flush A/Z=Scroll T/B=Top/Bottom) ", server)
+    let title = if app.view_mode == ViewMode::LogsView {
+        if let Some(server) = selected_server {
+            format!(" Logs: {} (←=Back ↑↓=Navigate Space=Select) ", server)
+        } else {
+            " Logs: All (←=Back ↑↓=Navigate Space=Select) ".to_string()
+        }
     } else {
-        " Logs: All (c=Copy A/Z=Scroll T/B=Top/Bottom) ".to_string()
+        if let Some(server) = selected_server {
+            format!(" Logs: {} (→=Focus c=Copy f=Flush A/Z=Scroll T/B=Top/Bottom) ", server)
+        } else {
+            " Logs: All (→=Focus c=Copy A/Z=Scroll T/B=Top/Bottom) ".to_string()
+        }
     };
 
     // Use cached logs - NO fetching during render!
@@ -581,11 +734,45 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
     app.visible_height = visible_height;  // Update for scroll bounds
     let scroll = app.scroll_offset as usize;
 
+    // Calculate selection range if active
+    let selection_range = if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {
+        let (from, to) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        Some((from, to))
+    } else {
+        None
+    };
+
     let log_lines: Vec<Line> = app.cached_logs
         .iter()
+        .enumerate()
         .skip(scroll)
         .take(visible_height as usize)
-        .map(|line| Line::from(Span::raw(line.as_str())))
+        .map(|(idx, line)| {
+            let is_cursor = app.view_mode == ViewMode::LogsView && idx == app.cursor_line;
+            let is_selected = selection_range.map_or(false, |(from, to)| idx >= from && idx <= to);
+
+            let mut style = Style::default();
+
+            if is_selected {
+                // Highlighted selection background
+                style = style.bg(Color::DarkGray).fg(Color::White);
+            }
+
+            if is_cursor {
+                // Cursor line - add bold and different background
+                if is_selected {
+                    style = style.bg(Color::Blue).add_modifier(Modifier::BOLD);
+                } else {
+                    style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+                }
+            }
+
+            Line::from(Span::styled(line.as_str(), style))
+        })
         .collect();
 
     let paragraph = Paragraph::new(log_lines)
@@ -593,7 +780,11 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(if app.view_mode == ViewMode::LogsView {
+                    Style::default().fg(Color::Yellow)  // Highlight when focused
+                } else {
+                    Style::default().fg(Color::Cyan)
+                }),
         );
 
     f.render_widget(paragraph, area);
