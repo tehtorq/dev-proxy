@@ -1258,11 +1258,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Start idle checker
-    let checker_map = server_map.clone();
-    tokio::spawn(async move {
-        idle_checker(checker_map).await;
-    });
+    // Idle checker disabled - will be revisited in the future
+    // let checker_map = server_map.clone();
+    // tokio::spawn(async move {
+    //     idle_checker(checker_map).await;
+    // });
 
     // Setup signal handlers
     let signals = Signals::new([SIGTERM, SIGINT, SIGQUIT])?;

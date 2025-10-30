@@ -16,6 +16,30 @@ use tokio::sync::mpsc;
 
 const MAX_LINES: usize = 1000;  // Keep more history per server
 
+/// Strip ANSI escape sequences (color codes, etc.) from a string
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Start of ANSI escape sequence
+            if chars.next() == Some('[') {
+                // Skip until we find a letter (the command character)
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 #[derive(Debug, Clone)]
 pub enum ServerCommand {
     Kill(String),    // Server name
@@ -160,6 +184,9 @@ pub struct TuiApp {
     cursor_line: usize,     // Current line position in logs view
     selection_start: Option<usize>,  // Start line of selection (None = no selection)
     selection_end: Option<usize>,    // End line of selection
+    // Status message (temporary, disappears after a few seconds)
+    status_message: Option<String>,
+    status_message_time: Option<Instant>,
 }
 
 impl TuiApp {
@@ -180,6 +207,22 @@ impl TuiApp {
             cursor_line: 0,
             selection_start: None,
             selection_end: None,
+            status_message: None,
+            status_message_time: None,
+        }
+    }
+
+    pub fn set_status_message(&mut self, message: String) {
+        self.status_message = Some(message);
+        self.status_message_time = Some(Instant::now());
+    }
+
+    pub fn clear_expired_status(&mut self) {
+        if let Some(time) = self.status_message_time {
+            if time.elapsed() > std::time::Duration::from_secs(3) {
+                self.status_message = None;
+                self.status_message_time = None;
+            }
         }
     }
 
@@ -206,6 +249,13 @@ impl TuiApp {
         // Get running status directly from LogStore (no log parsing!)
         self.running_servers = self.log_store.get_running_servers_snapshot();
 
+        // Ensure cursor is within bounds of new log count
+        if self.cursor_line >= self.cached_logs.len() && !self.cached_logs.is_empty() {
+            self.cursor_line = self.cached_logs.len() - 1;
+        } else if self.cached_logs.is_empty() {
+            self.cursor_line = 0;
+        }
+
         // Auto-scroll: if we were at the bottom, stay at the bottom as logs are added
         if was_at_bottom {
             self.scroll_to_bottom();
@@ -219,6 +269,10 @@ impl TuiApp {
             self.selected_index += 1;
         }
         self.refresh_current_logs();
+        // Reset cursor and selection when switching servers
+        self.cursor_line = 0;
+        self.selection_start = None;
+        self.selection_end = None;
         // Scroll to bottom to see most recent logs
         self.scroll_to_bottom();
     }
@@ -228,6 +282,10 @@ impl TuiApp {
             self.selected_index -= 1;
         }
         self.refresh_current_logs();
+        // Reset cursor and selection when switching servers
+        self.cursor_line = 0;
+        self.selection_start = None;
+        self.selection_end = None;
         // Scroll to bottom to see most recent logs
         self.scroll_to_bottom();
     }
@@ -270,13 +328,14 @@ impl TuiApp {
 
     pub fn enter_logs_view(&mut self) {
         self.view_mode = ViewMode::LogsView;
-        // Reset cursor and selection when entering logs view
-        self.cursor_line = 0;
+        // Set cursor to first visible line on screen (scroll_offset)
+        // This ensures the cursor is immediately visible
+        self.cursor_line = self.scroll_offset as usize;
         self.selection_start = None;
         self.selection_end = None;
         // Ensure cursor is within bounds
-        if !self.cached_logs.is_empty() {
-            self.cursor_line = 0;
+        if self.cursor_line >= self.cached_logs.len() && !self.cached_logs.is_empty() {
+            self.cursor_line = self.cached_logs.len() - 1;
         }
     }
 
@@ -323,12 +382,12 @@ impl TuiApp {
                     (end, start)
                 };
 
-                // Get selected text
+                // Get selected text and strip ANSI color codes
                 let selected_lines: Vec<String> = self.cached_logs
                     .iter()
                     .skip(from)
                     .take(to - from + 1)
-                    .cloned()
+                    .map(|line| strip_ansi_codes(line))
                     .collect();
 
                 let selected_text = selected_lines.join("\n");
@@ -337,16 +396,14 @@ impl TuiApp {
                 match arboard::Clipboard::new() {
                     Ok(mut clipboard) => {
                         if clipboard.set_text(&selected_text).is_ok() {
-                            // Flash a message in the logs
-                            if let Some(server_name) = self.get_selected_server() {
-                                self.log_store.add_line(server_name.to_string(), format!("📋 Copied {} lines to clipboard!", to - from + 1));
-                            }
+                            // Show temporary status message
+                            self.set_status_message(format!("📋 Copied {} lines to clipboard!", to - from + 1));
+                        } else {
+                            self.set_status_message("❌ Failed to copy to clipboard".to_string());
                         }
                     }
                     Err(_) => {
-                        if let Some(server_name) = self.get_selected_server() {
-                            self.log_store.add_line(server_name.to_string(), "❌ Failed to access clipboard".to_string());
-                        }
+                        self.set_status_message("❌ Failed to access clipboard".to_string());
                     }
                 }
 
@@ -582,23 +639,26 @@ fn run_app(
                         }
                     }
                     KeyCode::Char('c') => {
-                        // Copy logs to clipboard
-                        let logs_text = app.cached_logs.join("\n");
+                        // Copy logs to clipboard (strip ANSI codes)
+                        let logs_text: String = app.cached_logs
+                            .iter()
+                            .map(|line| strip_ansi_codes(line))
+                            .collect::<Vec<String>>()
+                            .join("\n");
                         match arboard::Clipboard::new() {
                             Ok(mut clipboard) => {
                                 if clipboard.set_text(&logs_text).is_ok() {
-                                    // Flash a message in the logs
-                                    if let Some(server_name) = app.get_selected_server() {
-                                        app.log_store.add_line(server_name.to_string(), "📋 Copied to clipboard!".to_string());
-                                    }
+                                    app.set_status_message("📋 Copied all logs to clipboard!".to_string());
+                                } else {
+                                    app.set_status_message("❌ Failed to copy to clipboard".to_string());
                                 }
                             }
                             Err(_) => {
-                                if let Some(server_name) = app.get_selected_server() {
-                                    app.log_store.add_line(server_name.to_string(), "❌ Failed to access clipboard".to_string());
-                                }
+                                app.set_status_message("❌ Failed to access clipboard".to_string());
                             }
                         }
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
                     }
                     KeyCode::Home => {
                         app.selected_index = 0;
@@ -638,7 +698,9 @@ fn run_app(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Timeout - check for log updates and redraw if needed
-                if app.has_log_changes() {
+                let needs_redraw = app.has_log_changes() || app.status_message.is_some();
+
+                if needs_redraw {
                     const MIN_DRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
                     let time_since_last_draw = app.last_draw_time.elapsed();
 
@@ -657,13 +719,38 @@ fn run_app(
 }
 
 fn ui(f: &mut Frame, app: &mut TuiApp) {
+    // Clear expired status messages
+    app.clear_expired_status();
+
+    // Create main layout with status bar at bottom
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),      // Main content area
+            Constraint::Length(1),   // Status bar
+        ])
+        .split(f.area());
+
+    // Split main area horizontally for server list and logs
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(f.area());
+        .split(main_chunks[0]);
 
     render_server_list(f, app, chunks[0]);
     render_logs(f, app, chunks[1]);
+    render_status_bar(f, app, main_chunks[1]);
+}
+
+fn render_status_bar(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) {
+    let status_line = if let Some(ref msg) = app.status_message {
+        Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
+    } else {
+        Line::from("")
+    };
+
+    let paragraph = Paragraph::new(status_line);
+    f.render_widget(paragraph, area);
 }
 
 fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) {
@@ -746,14 +833,16 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
         None
     };
 
-    let log_lines: Vec<Line> = app.cached_logs
+    // Build visible log lines with proper styling
+    let mut log_lines: Vec<Line> = app.cached_logs
         .iter()
         .enumerate()
         .skip(scroll)
         .take(visible_height as usize)
-        .map(|(idx, line)| {
-            let is_cursor = app.view_mode == ViewMode::LogsView && idx == app.cursor_line;
-            let is_selected = selection_range.map_or(false, |(from, to)| idx >= from && idx <= to);
+        .map(|(original_idx, line)| {
+            let actual_idx = original_idx;
+            let is_cursor = app.view_mode == ViewMode::LogsView && actual_idx == app.cursor_line;
+            let is_selected = selection_range.map_or(false, |(from, to)| actual_idx >= from && actual_idx <= to);
 
             let mut style = Style::default();
 
@@ -774,6 +863,11 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
             Line::from(Span::styled(line.as_str(), style))
         })
         .collect();
+
+    // Fill remaining space with empty lines to prevent visual corruption
+    while log_lines.len() < visible_height as usize {
+        log_lines.push(Line::from(""));
+    }
 
     let paragraph = Paragraph::new(log_lines)
         .block(
