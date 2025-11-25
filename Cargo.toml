@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full", "sync"] }
+tokio = { version = "1", features = ["full", "sync", "net"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full", "client-legacy", "server"] }
 http-body-util = "0.1"
@@ -22,6 +22,7 @@ ratatui = "0.28"
 crossterm = "0.28"
 dashmap = "6.1"
 arboard = "3.4"
+chrono = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

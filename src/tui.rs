@@ -1,10 +1,10 @@
-use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame, Terminal,
 };
 use std::collections::{HashMap, HashSet};
@@ -14,18 +14,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-const MAX_LINES: usize = 1000;  // Keep more history per server
+const MAX_LINES: usize = 1000;
 
-/// Strip ANSI escape sequences (color codes, etc.) from a string
+/// Strip ANSI escape sequences from a string
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
-            // Start of ANSI escape sequence
-            if chars.next() == Some('[') {
-                // Skip until we find a letter (the command character)
+            if chars.peek() == Some(&'[') {
+                chars.next();
                 for ch in chars.by_ref() {
                     if ch.is_ascii_alphabetic() {
                         break;
@@ -40,18 +39,55 @@ fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
-#[derive(Debug, Clone)]
-pub enum ServerCommand {
-    Kill(String),    // Server name
-    Restart(String), // Server name
+/// Detect log level from line content
+fn detect_log_level(line: &str) -> LogLevel {
+    let lower = line.to_lowercase();
+    if lower.contains("error") || lower.contains("err!") || lower.contains("panic") || lower.contains("fatal") {
+        LogLevel::Error
+    } else if lower.contains("warn") || lower.contains("warning") {
+        LogLevel::Warn
+    } else if lower.contains("info") {
+        LogLevel::Info
+    } else if lower.contains("debug") || lower.contains("trace") {
+        LogLevel::Debug
+    } else {
+        LogLevel::Normal
+    }
 }
 
-// Pre-formatted, ready-to-render log lines for each server
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Normal,
+}
+
+impl LogLevel {
+    fn color(&self) -> Color {
+        match self {
+            LogLevel::Error => Color::Red,
+            LogLevel::Warn => Color::Yellow,
+            LogLevel::Info => Color::Cyan,
+            LogLevel::Debug => Color::DarkGray,
+            LogLevel::Normal => Color::White,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ServerCommand {
+    Kill(String),
+    Restart(String),
+}
+
 pub struct LogStore {
     servers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     all_logs_cache: Arc<Mutex<Vec<String>>>,
     active_servers: Arc<Mutex<HashSet<String>>>,
-    running_servers: Arc<Mutex<HashSet<String>>>,  // Track actual process state
+    running_servers: Arc<Mutex<HashSet<String>>>,
+    server_ports: Arc<Mutex<HashMap<String, u16>>>,
     version: Arc<AtomicU64>,
 }
 
@@ -62,6 +98,7 @@ impl LogStore {
             all_logs_cache: Arc::new(Mutex::new(Vec::new())),
             active_servers: Arc::new(Mutex::new(HashSet::new())),
             running_servers: Arc::new(Mutex::new(HashSet::new())),
+            server_ports: Arc::new(Mutex::new(HashMap::new())),
             version: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -74,6 +111,20 @@ impl LogStore {
     pub fn set_server_stopped(&self, server_name: String) {
         let mut running = self.running_servers.lock().unwrap();
         running.remove(&server_name);
+        drop(running);
+        let mut ports = self.server_ports.lock().unwrap();
+        ports.remove(&server_name);
+    }
+
+    pub fn set_server_port(&self, server_name: String, port: u16) {
+        let mut ports = self.server_ports.lock().unwrap();
+        ports.insert(server_name, port);
+        drop(ports);
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn get_server_ports_snapshot(&self) -> HashMap<String, u16> {
+        self.server_ports.lock().unwrap().clone()
     }
 
     pub fn add_line(&self, server_name: String, line: String) {
@@ -85,21 +136,18 @@ impl LogStore {
         }
         drop(servers);
 
-        // Track active servers
         let mut active = self.active_servers.lock().unwrap();
         active.insert(server_name.clone());
         drop(active);
 
-        // Update the "All" cache with the new formatted line
         let formatted = format!("[{}] {}", server_name, line);
         let mut cache = self.all_logs_cache.lock().unwrap();
         cache.push(formatted);
-        if cache.len() > MAX_LINES * 10 {  // Allow more lines in "All" view
+        if cache.len() > MAX_LINES * 10 {
             cache.remove(0);
         }
         drop(cache);
 
-        // Increment version to signal change
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -114,15 +162,10 @@ impl LogStore {
                 servers.get(name).cloned().unwrap_or_default()
             }
             None => {
-                // "All" - return cached formatted logs (zero allocations!)
                 let cache = self.all_logs_cache.lock().unwrap();
                 cache.clone()
             }
         }
-    }
-
-    pub fn get_active_servers_snapshot(&self) -> HashSet<String> {
-        self.active_servers.lock().unwrap().clone()
     }
 
     pub fn get_running_servers_snapshot(&self) -> HashSet<String> {
@@ -130,28 +173,17 @@ impl LogStore {
     }
 
     pub fn clear_logs(&self, server_name: &str) {
-        // Clear logs for specific server
         let mut servers = self.servers.lock().unwrap();
         if let Some(logs) = servers.get_mut(server_name) {
             logs.clear();
         }
         drop(servers);
 
-        // Also clear from "All" cache - just rebuild it
-        let servers = self.servers.lock().unwrap();
-        let mut all = Vec::new();
-        for (name, lines) in servers.iter() {
-            for line in lines {
-                all.push(format!("[{}] {}", name, line));
-            }
-        }
-        drop(servers);
-
+        let prefix = format!("[{}] ", server_name);
         let mut cache = self.all_logs_cache.lock().unwrap();
-        *cache = all;
+        cache.retain(|line| !line.starts_with(&prefix));
         drop(cache);
 
-        // Increment version to trigger UI update
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -165,41 +197,52 @@ pub struct ServerInfo {
 enum ViewMode {
     ServerList,
     LogsView,
+    Help,
+    Search,
 }
 
 pub struct TuiApp {
     servers: Vec<ServerInfo>,
     selected_index: usize,
     scroll_offset: u16,
-    visible_height: u16,  // Track terminal height for scroll bounds
+    visible_height: u16,
     cached_logs: Vec<String>,
-    cached_active_servers: HashSet<String>,
-    running_servers: HashSet<String>,  // Track which servers are actually running
+    filtered_logs: Vec<(usize, String)>, // (original_index, line)
+    running_servers: HashSet<String>,
+    server_ports: HashMap<String, u16>,
     log_store: Arc<LogStore>,
     last_version: u64,
     last_draw_time: Instant,
     command_tx: Option<mpsc::UnboundedSender<ServerCommand>>,
     view_mode: ViewMode,
-    // Text selection state (for logs view)
-    cursor_line: usize,     // Current line position in logs view
-    selection_start: Option<usize>,  // Start line of selection (None = no selection)
-    selection_end: Option<usize>,    // End line of selection
-    // Status message (temporary, disappears after a few seconds)
+    // Text selection state
+    cursor_line: usize,
+    selection_start: Option<usize>,
+    selection_end: Option<usize>,
+    // Status message
     status_message: Option<String>,
     status_message_time: Option<Instant>,
+    // Search state
+    search_query: String,
+    search_active: bool,
+    // Configuration
+    idle_timeout: u64,
+    // Statistics
+    started_at: Instant,
 }
 
 impl TuiApp {
-    pub fn new(servers: Vec<ServerInfo>) -> Self {
+    pub fn new(servers: Vec<ServerInfo>, idle_timeout: u64) -> Self {
         Self {
             servers,
             selected_index: 0,
             scroll_offset: 0,
-            visible_height: 20,  // Default, will be updated during render
+            visible_height: 20,
             cached_logs: Vec::new(),
-            cached_active_servers: HashSet::new(),
+            filtered_logs: Vec::new(),
             running_servers: HashSet::new(),
-            log_store: Arc::new(LogStore::new()), // Placeholder, will be set later
+            server_ports: HashMap::new(),
+            log_store: Arc::new(LogStore::new()),
             last_version: 0,
             last_draw_time: Instant::now(),
             command_tx: None,
@@ -209,6 +252,10 @@ impl TuiApp {
             selection_end: None,
             status_message: None,
             status_message_time: None,
+            search_query: String::new(),
+            search_active: false,
+            idle_timeout,
+            started_at: Instant::now(),
         }
     }
 
@@ -234,29 +281,43 @@ impl TuiApp {
         self.log_store.get_version() != self.last_version
     }
 
+    fn apply_search_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_logs = self.cached_logs.iter()
+                .enumerate()
+                .map(|(i, s)| (i, s.clone()))
+                .collect();
+        } else {
+            let query_lower = self.search_query.to_lowercase();
+            self.filtered_logs = self.cached_logs.iter()
+                .enumerate()
+                .filter(|(_, line)| line.to_lowercase().contains(&query_lower))
+                .map(|(i, s)| (i, s.clone()))
+                .collect();
+        }
+    }
+
     pub fn refresh_current_logs(&mut self) {
-        // Check if we're at the bottom before refreshing
         let was_at_bottom = {
-            let total_lines = self.cached_logs.len() as u16;
+            let total_lines = self.get_display_logs().len() as u16;
             let max_scroll = total_lines.saturating_sub(self.visible_height);
             self.scroll_offset >= max_scroll
         };
 
         let selected = self.get_selected_server();
         self.cached_logs = self.log_store.get_lines(selected);
-        self.cached_active_servers = self.log_store.get_active_servers_snapshot();
-
-        // Get running status directly from LogStore (no log parsing!)
         self.running_servers = self.log_store.get_running_servers_snapshot();
+        self.server_ports = self.log_store.get_server_ports_snapshot();
 
-        // Ensure cursor is within bounds of new log count
-        if self.cursor_line >= self.cached_logs.len() && !self.cached_logs.is_empty() {
-            self.cursor_line = self.cached_logs.len() - 1;
-        } else if self.cached_logs.is_empty() {
+        self.apply_search_filter();
+
+        let display_len = self.get_display_logs().len();
+        if self.cursor_line >= display_len && display_len > 0 {
+            self.cursor_line = display_len - 1;
+        } else if display_len == 0 {
             self.cursor_line = 0;
         }
 
-        // Auto-scroll: if we were at the bottom, stay at the bottom as logs are added
         if was_at_bottom {
             self.scroll_to_bottom();
         }
@@ -264,16 +325,18 @@ impl TuiApp {
         self.last_version = self.log_store.get_version();
     }
 
+    fn get_display_logs(&self) -> &Vec<(usize, String)> {
+        &self.filtered_logs
+    }
+
     pub fn next(&mut self) {
         if self.selected_index < self.servers.len() {
             self.selected_index += 1;
         }
         self.refresh_current_logs();
-        // Reset cursor and selection when switching servers
         self.cursor_line = 0;
         self.selection_start = None;
         self.selection_end = None;
-        // Scroll to bottom to see most recent logs
         self.scroll_to_bottom();
     }
 
@@ -282,31 +345,26 @@ impl TuiApp {
             self.selected_index -= 1;
         }
         self.refresh_current_logs();
-        // Reset cursor and selection when switching servers
         self.cursor_line = 0;
         self.selection_start = None;
         self.selection_end = None;
-        // Scroll to bottom to see most recent logs
         self.scroll_to_bottom();
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        let total_lines = self.cached_logs.len() as u16;
+        let total_lines = self.get_display_logs().len() as u16;
         self.scroll_offset = total_lines.saturating_sub(self.visible_height);
     }
 
     pub fn scroll_down(&mut self) {
-        // Don't scroll past the last visible line
-        let total_lines = self.cached_logs.len() as u16;
+        let total_lines = self.get_display_logs().len() as u16;
         let max_scroll = total_lines.saturating_sub(self.visible_height);
-
         if self.scroll_offset < max_scroll {
             self.scroll_offset = self.scroll_offset.saturating_add(1);
         }
     }
 
     pub fn scroll_up(&mut self) {
-        // Don't scroll past the first line (already handled by saturating_sub)
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
 
@@ -328,14 +386,12 @@ impl TuiApp {
 
     pub fn enter_logs_view(&mut self) {
         self.view_mode = ViewMode::LogsView;
-        // Set cursor to first visible line on screen (scroll_offset)
-        // This ensures the cursor is immediately visible
         self.cursor_line = self.scroll_offset as usize;
         self.selection_start = None;
         self.selection_end = None;
-        // Ensure cursor is within bounds
-        if self.cursor_line >= self.cached_logs.len() && !self.cached_logs.is_empty() {
-            self.cursor_line = self.cached_logs.len() - 1;
+        let display_len = self.get_display_logs().len();
+        if self.cursor_line >= display_len && display_len > 0 {
+            self.cursor_line = display_len - 1;
         }
     }
 
@@ -348,7 +404,6 @@ impl TuiApp {
     pub fn move_cursor_up(&mut self) {
         if self.cursor_line > 0 {
             self.cursor_line -= 1;
-            // Auto-scroll to keep cursor visible
             if self.cursor_line < self.scroll_offset as usize {
                 self.scroll_offset = self.cursor_line as u16;
             }
@@ -356,9 +411,9 @@ impl TuiApp {
     }
 
     pub fn move_cursor_down(&mut self) {
-        if self.cursor_line < self.cached_logs.len().saturating_sub(1) {
+        let max_line = self.get_display_logs().len().saturating_sub(1);
+        if self.cursor_line < max_line {
             self.cursor_line += 1;
-            // Auto-scroll to keep cursor visible
             let bottom_visible = self.scroll_offset as usize + self.visible_height as usize;
             if self.cursor_line >= bottom_visible {
                 self.scroll_offset = (self.cursor_line as u16).saturating_sub(self.visible_height - 1);
@@ -369,45 +424,36 @@ impl TuiApp {
     pub fn toggle_selection(&mut self) {
         match self.selection_start {
             None => {
-                // Start new selection
                 self.selection_start = Some(self.cursor_line);
                 self.selection_end = Some(self.cursor_line);
             }
             Some(start) => {
-                // End selection and copy to clipboard
                 let end = self.cursor_line;
-                let (from, to) = if start <= end {
-                    (start, end)
-                } else {
-                    (end, start)
-                };
+                let (from, to) = if start <= end { (start, end) } else { (end, start) };
 
-                // Get selected text and strip ANSI color codes
-                let selected_lines: Vec<String> = self.cached_logs
+                let display_logs = self.get_display_logs();
+                let selected_lines: Vec<String> = display_logs
                     .iter()
                     .skip(from)
                     .take(to - from + 1)
-                    .map(|line| strip_ansi_codes(line))
+                    .map(|(_, line)| strip_ansi_codes(line))
                     .collect();
 
                 let selected_text = selected_lines.join("\n");
 
-                // Copy to clipboard
                 match arboard::Clipboard::new() {
                     Ok(mut clipboard) => {
                         if clipboard.set_text(&selected_text).is_ok() {
-                            // Show temporary status message
-                            self.set_status_message(format!("📋 Copied {} lines to clipboard!", to - from + 1));
+                            self.set_status_message(format!("Copied {} lines to clipboard", to - from + 1));
                         } else {
-                            self.set_status_message("❌ Failed to copy to clipboard".to_string());
+                            self.set_status_message("Failed to copy to clipboard".to_string());
                         }
                     }
                     Err(_) => {
-                        self.set_status_message("❌ Failed to access clipboard".to_string());
+                        self.set_status_message("Failed to access clipboard".to_string());
                     }
                 }
 
-                // Clear selection
                 self.selection_start = None;
                 self.selection_end = None;
             }
@@ -415,9 +461,64 @@ impl TuiApp {
     }
 
     pub fn update_selection(&mut self) {
-        // Update selection end as cursor moves (if selection is active)
         if self.selection_start.is_some() {
             self.selection_end = Some(self.cursor_line);
+        }
+    }
+
+    pub fn toggle_help(&mut self) {
+        if self.view_mode == ViewMode::Help {
+            self.view_mode = ViewMode::ServerList;
+        } else {
+            self.view_mode = ViewMode::Help;
+        }
+    }
+
+    pub fn start_search(&mut self) {
+        self.view_mode = ViewMode::Search;
+        self.search_query.clear();
+        self.search_active = true;
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.view_mode = ViewMode::ServerList;
+        self.search_query.clear();
+        self.search_active = false;
+        self.apply_search_filter();
+    }
+
+    pub fn confirm_search(&mut self) {
+        self.view_mode = ViewMode::ServerList;
+        self.search_active = !self.search_query.is_empty();
+        self.apply_search_filter();
+        self.scroll_offset = 0;
+        self.cursor_line = 0;
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.search_active = false;
+        self.apply_search_filter();
+    }
+
+    pub fn add_search_char(&mut self, c: char) {
+        self.search_query.push(c);
+        self.apply_search_filter();
+    }
+
+    pub fn remove_search_char(&mut self) {
+        self.search_query.pop();
+        self.apply_search_filter();
+    }
+
+    fn format_uptime(&self) -> String {
+        let secs = self.started_at.elapsed().as_secs();
+        if secs < 60 {
+            format!("{}s", secs)
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
         }
     }
 }
@@ -427,7 +528,6 @@ pub fn run_tui_blocking(
     log_store: Arc<LogStore>,
     mut log_rx: mpsc::UnboundedReceiver<(String, String)>,
 ) -> io::Result<()> {
-    // Setup terminal
     let mut stdout = io::stdout();
     crossterm::execute!(
         stdout,
@@ -440,10 +540,8 @@ pub fn run_tui_blocking(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // Give app access to log_store
     app.log_store = log_store.clone();
 
-    // Spawn background task to collect logs with batching to prevent CPU starvation
     let store_clone = log_store.clone();
     std::thread::spawn(move || {
         use std::time::{Duration, Instant};
@@ -453,35 +551,30 @@ pub fn run_tui_blocking(
         const BATCH_INTERVAL: Duration = Duration::from_millis(50);
 
         loop {
-            // Try to receive without blocking first
             match log_rx.try_recv() {
                 Ok((server_name, message)) => {
                     batch.push((server_name, message));
 
-                    // Flush if batch is full or enough time has passed
                     if batch.len() >= 50 || last_flush.elapsed() >= BATCH_INTERVAL {
                         for (name, msg) in batch.drain(..) {
                             store_clone.add_line(name, msg);
                         }
                         last_flush = Instant::now();
-                        // Yield CPU to TUI thread
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 }
                 Err(_) => {
-                    // No messages available, flush any pending batch
                     if !batch.is_empty() {
                         for (name, msg) in batch.drain(..) {
                             store_clone.add_line(name, msg);
                         }
                         last_flush = Instant::now();
                     }
-                    // Block waiting for next message
                     match log_rx.blocking_recv() {
                         Some((server_name, message)) => {
                             batch.push((server_name, message));
                         }
-                        None => break, // Channel closed
+                        None => break,
                     }
                 }
             }
@@ -490,7 +583,6 @@ pub fn run_tui_blocking(
 
     let result = run_app(&mut terminal, &mut app);
 
-    // Restore terminal
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
@@ -506,20 +598,17 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
 ) -> io::Result<()> {
-    // Initial refresh and draw
     app.refresh_current_logs();
     terminal.draw(|f| ui(f, app))?;
     app.last_draw_time = Instant::now();
 
-    // Spawn dedicated thread to read keyboard events using crossterm
-    // With child processes having .stdin(Stdio::null()), they won't steal our keypresses
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let _event_thread = std::thread::spawn(move || {
         loop {
             match crossterm::event::read() {
                 Ok(evt) => {
                     if event_tx.send(evt).is_err() {
-                        break; // Channel closed, exit thread
+                        break;
                     }
                 }
                 Err(_) => break,
@@ -528,24 +617,71 @@ fn run_app(
     });
 
     loop {
-        // Wait for keyboard event with timeout (for log refresh)
         match event_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                // Handle search mode input first
+                if app.view_mode == ViewMode::Search {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.cancel_search();
+                        }
+                        KeyCode::Enter => {
+                            app.confirm_search();
+                        }
+                        KeyCode::Backspace => {
+                            app.remove_search_char();
+                        }
+                        KeyCode::Char(c) => {
+                            app.add_search_char(c);
+                        }
+                        _ => {}
+                    }
+                    terminal.draw(|f| ui(f, app))?;
+                    app.last_draw_time = Instant::now();
+                    continue;
+                }
+
+                // Handle help mode - any key closes it
+                if app.view_mode == ViewMode::Help {
+                    app.toggle_help();
+                    terminal.draw(|f| ui(f, app))?;
+                    app.last_draw_time = Instant::now();
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
+                        if app.view_mode == ViewMode::LogsView {
+                            app.exit_logs_view();
+                            terminal.draw(|f| ui(f, app))?;
+                            app.last_draw_time = Instant::now();
+                        } else if app.search_active {
+                            app.clear_search();
+                            terminal.draw(|f| ui(f, app))?;
+                            app.last_draw_time = Instant::now();
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                        return Ok(());
+                    KeyCode::Char('?') => {
+                        app.toggle_help();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
+                    }
+                    KeyCode::Char('/') => {
+                        app.start_search();
+                        terminal.draw(|f| ui(f, app))?;
+                        app.last_draw_time = Instant::now();
                     }
                     KeyCode::Right if app.view_mode == ViewMode::ServerList => {
-                        // Enter logs view
                         app.enter_logs_view();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
                     KeyCode::Left if app.view_mode == ViewMode::LogsView => {
-                        // Exit logs view, return to server list
                         app.exit_logs_view();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
@@ -573,7 +709,6 @@ fn run_app(
                         app.last_draw_time = Instant::now();
                     }
                     KeyCode::Char(' ') if app.view_mode == ViewMode::LogsView => {
-                        // Toggle selection
                         app.toggle_selection();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
@@ -604,13 +739,11 @@ fn run_app(
                         app.last_draw_time = Instant::now();
                     }
                     KeyCode::Char('t') | KeyCode::Char('T') => {
-                        // Jump to top of logs
                         app.scroll_offset = 0;
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
                     }
                     KeyCode::Char('b') | KeyCode::Char('B') => {
-                        // Jump to bottom of logs
                         app.scroll_to_bottom();
                         terminal.draw(|f| ui(f, app))?;
                         app.last_draw_time = Instant::now();
@@ -620,6 +753,10 @@ fn run_app(
                             if let Some(ref tx) = app.command_tx {
                                 let _ = tx.send(ServerCommand::Kill(server.name.clone()));
                             }
+                        } else {
+                            app.set_status_message("Select a specific server to kill".to_string());
+                            terminal.draw(|f| ui(f, app))?;
+                            app.last_draw_time = Instant::now();
                         }
                     }
                     KeyCode::Char('r') => {
@@ -627,6 +764,10 @@ fn run_app(
                             if let Some(ref tx) = app.command_tx {
                                 let _ = tx.send(ServerCommand::Restart(server.name.clone()));
                             }
+                        } else {
+                            app.set_status_message("Select a specific server to restart".to_string());
+                            terminal.draw(|f| ui(f, app))?;
+                            app.last_draw_time = Instant::now();
                         }
                     }
                     KeyCode::Char('f') => {
@@ -639,22 +780,21 @@ fn run_app(
                         }
                     }
                     KeyCode::Char('c') => {
-                        // Copy logs to clipboard (strip ANSI codes)
-                        let logs_text: String = app.cached_logs
+                        let logs_text: String = app.get_display_logs()
                             .iter()
-                            .map(|line| strip_ansi_codes(line))
+                            .map(|(_, line)| strip_ansi_codes(line))
                             .collect::<Vec<String>>()
                             .join("\n");
                         match arboard::Clipboard::new() {
                             Ok(mut clipboard) => {
                                 if clipboard.set_text(&logs_text).is_ok() {
-                                    app.set_status_message("📋 Copied all logs to clipboard!".to_string());
+                                    app.set_status_message("Copied all logs to clipboard".to_string());
                                 } else {
-                                    app.set_status_message("❌ Failed to copy to clipboard".to_string());
+                                    app.set_status_message("Failed to copy to clipboard".to_string());
                                 }
                             }
                             Err(_) => {
-                                app.set_status_message("❌ Failed to access clipboard".to_string());
+                                app.set_status_message("Failed to access clipboard".to_string());
                             }
                         }
                         terminal.draw(|f| ui(f, app))?;
@@ -678,7 +818,6 @@ fn run_app(
                 }
             }
             Ok(Event::Mouse(mouse)) => {
-                // Handle mouse wheel scrolling
                 match mouse.kind {
                     MouseEventKind::ScrollDown => {
                         app.scroll_down();
@@ -693,11 +832,8 @@ fn run_app(
                     _ => {}
                 }
             }
-            Ok(_) => {
-                // Ignore other events (resize, etc.)
-            }
+            Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Timeout - check for log updates and redraw if needed
                 let needs_redraw = app.has_log_changes() || app.status_message.is_some();
 
                 if needs_redraw {
@@ -719,19 +855,16 @@ fn run_app(
 }
 
 fn ui(f: &mut Frame, app: &mut TuiApp) {
-    // Clear expired status messages
     app.clear_expired_status();
 
-    // Create main layout with status bar at bottom
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),      // Main content area
-            Constraint::Length(1),   // Status bar
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
         .split(f.area());
 
-    // Split main area horizontally for server list and logs
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -740,48 +873,87 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
     render_server_list(f, app, chunks[0]);
     render_logs(f, app, chunks[1]);
     render_status_bar(f, app, main_chunks[1]);
+
+    // Render overlays
+    if app.view_mode == ViewMode::Help {
+        render_help_overlay(f, app);
+    } else if app.view_mode == ViewMode::Search {
+        render_search_overlay(f, app);
+    }
 }
 
-fn render_status_bar(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) {
-    let status_line = if let Some(ref msg) = app.status_message {
-        Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)))
+fn render_status_bar(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let uptime = app.format_uptime();
+    let running_count = app.running_servers.len();
+    let total_count = app.servers.len();
+
+    let status_text = if let Some(ref msg) = app.status_message {
+        msg.clone()
+    } else if app.search_active {
+        format!(
+            "Filter: \"{}\" ({} matches) | {} | {}/{} running | ?=Help",
+            app.search_query,
+            app.get_display_logs().len(),
+            uptime,
+            running_count,
+            total_count
+        )
     } else {
-        Line::from("")
+        format!(
+            "Uptime: {} | {}/{} servers running | Idle timeout: {}s | ?=Help",
+            uptime, running_count, total_count, app.idle_timeout
+        )
     };
 
-    let paragraph = Paragraph::new(status_line);
+    let color = if app.status_message.is_some() {
+        Color::Green
+    } else if app.search_active {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+
+    let paragraph = Paragraph::new(Line::from(Span::styled(status_text, Style::default().fg(color))));
     f.render_widget(paragraph, area);
 }
 
-fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) {
+fn render_server_list(f: &mut Frame, app: &TuiApp, area: Rect) {
     let mut items = vec![ListItem::new(Line::from(vec![
-        Span::styled("◉ ", Style::default().fg(Color::Blue)),
+        Span::styled("* ", Style::default().fg(Color::Blue)),
         Span::raw("All"),
     ]))];
 
     for server in &app.servers {
-        // Use cached status - NO mutex lock during render!
         let is_running = app.running_servers.contains(&server.name);
-        let status_icon = if is_running { "●" } else { "○" };
-        let status_color = if is_running {
-            Color::Green
+        let status_icon = if is_running { "*" } else { "o" };
+        let status_color = if is_running { Color::Green } else { Color::DarkGray };
+
+        let port_display = if let Some(port) = app.server_ports.get(&server.name) {
+            format!(" [{}]", port)
         } else {
-            Color::DarkGray
+            String::new()
         };
 
         items.push(ListItem::new(Line::from(vec![
             Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
             Span::raw(&server.domain),
+            Span::styled(port_display, Style::default().fg(Color::DarkGray)),
         ])));
     }
+
+    let title = if app.view_mode == ViewMode::ServerList {
+        " Servers [ACTIVE] "
+    } else {
+        " Servers "
+    };
 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Servers (↑↓=Nav →=Logs Enter=Open k=Kill r=Restart q=Quit) ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(if app.view_mode == ViewMode::ServerList {
-                    Style::default().fg(Color::Yellow)  // Highlight when focused
+                    Style::default().fg(Color::Yellow)
                 } else {
                     Style::default().fg(Color::Cyan)
                 }),
@@ -791,7 +963,7 @@ fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) 
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("► ");
+        .highlight_symbol("> ");
 
     let mut state = ListState::default();
     state.select(Some(app.selected_index));
@@ -799,60 +971,58 @@ fn render_server_list(f: &mut Frame, app: &TuiApp, area: ratatui::layout::Rect) 
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
+fn render_logs(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let selected_server = app.get_selected_server();
 
-    let title = if app.view_mode == ViewMode::LogsView {
-        if let Some(server) = selected_server {
-            format!(" Logs: {} (←=Back ↑↓=Navigate Space=Select) ", server)
-        } else {
-            " Logs: All (←=Back ↑↓=Navigate Space=Select) ".to_string()
+    let title = match app.view_mode {
+        ViewMode::LogsView => {
+            if let Some(server) = selected_server {
+                format!(" Logs: {} [NAVIGATE] ", server)
+            } else {
+                " Logs: All [NAVIGATE] ".to_string()
+            }
         }
-    } else {
-        if let Some(server) = selected_server {
-            format!(" Logs: {} (→=Focus c=Copy f=Flush A/Z=Scroll T/B=Top/Bottom) ", server)
-        } else {
-            " Logs: All (→=Focus c=Copy A/Z=Scroll T/B=Top/Bottom) ".to_string()
+        _ => {
+            if let Some(server) = selected_server {
+                format!(" Logs: {} ", server)
+            } else {
+                " Logs: All ".to_string()
+            }
         }
     };
 
-    // Use cached logs - NO fetching during render!
     let visible_height = area.height.saturating_sub(2);
-    app.visible_height = visible_height;  // Update for scroll bounds
+    app.visible_height = visible_height;
     let scroll = app.scroll_offset as usize;
 
-    // Calculate selection range if active
     let selection_range = if let (Some(start), Some(end)) = (app.selection_start, app.selection_end) {
-        let (from, to) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
+        let (from, to) = if start <= end { (start, end) } else { (end, start) };
         Some((from, to))
     } else {
         None
     };
 
-    // Build visible log lines with proper styling
-    let mut log_lines: Vec<Line> = app.cached_logs
+    let display_logs = app.get_display_logs();
+    let mut log_lines: Vec<Line> = display_logs
         .iter()
         .enumerate()
         .skip(scroll)
         .take(visible_height as usize)
-        .map(|(original_idx, line)| {
-            let actual_idx = original_idx;
-            let is_cursor = app.view_mode == ViewMode::LogsView && actual_idx == app.cursor_line;
-            let is_selected = selection_range.map_or(false, |(from, to)| actual_idx >= from && actual_idx <= to);
+        .map(|(display_idx, (_, line))| {
+            let is_cursor = app.view_mode == ViewMode::LogsView && display_idx == app.cursor_line;
+            let is_selected = selection_range.map_or(false, |(from, to)| display_idx >= from && display_idx <= to);
 
-            let mut style = Style::default();
+            // Determine base color from log level
+            let log_level = detect_log_level(line);
+            let base_color = log_level.color();
+
+            let mut style = Style::default().fg(base_color);
 
             if is_selected {
-                // Highlighted selection background
                 style = style.bg(Color::DarkGray).fg(Color::White);
             }
 
             if is_cursor {
-                // Cursor line - add bold and different background
                 if is_selected {
                     style = style.bg(Color::Blue).add_modifier(Modifier::BOLD);
                 } else {
@@ -860,11 +1030,27 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
                 }
             }
 
+            // Highlight search matches
+            if app.search_active && !app.search_query.is_empty() {
+                let query_lower = app.search_query.to_lowercase();
+                let line_lower = line.to_lowercase();
+                if let Some(pos) = line_lower.find(&query_lower) {
+                    let before = &line[..pos];
+                    let matched = &line[pos..pos + app.search_query.len()];
+                    let after = &line[pos + app.search_query.len()..];
+
+                    return Line::from(vec![
+                        Span::styled(before.to_string(), style),
+                        Span::styled(matched.to_string(), style.bg(Color::Yellow).fg(Color::Black)),
+                        Span::styled(after.to_string(), style),
+                    ]);
+                }
+            }
+
             Line::from(Span::styled(line.as_str(), style))
         })
         .collect();
 
-    // Fill remaining space with empty lines to prevent visual corruption
     while log_lines.len() < visible_height as usize {
         log_lines.push(Line::from(""));
     }
@@ -875,7 +1061,7 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
                 .title(title)
                 .borders(Borders::ALL)
                 .border_style(if app.view_mode == ViewMode::LogsView {
-                    Style::default().fg(Color::Yellow)  // Highlight when focused
+                    Style::default().fg(Color::Yellow)
                 } else {
                     Style::default().fg(Color::Cyan)
                 }),
@@ -883,12 +1069,11 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
 
     f.render_widget(paragraph, area);
 
-    // Only show scrollbar if content doesn't fit on screen
-    let total_lines = app.cached_logs.len();
+    let total_lines = display_logs.len();
     if total_lines > visible_height as usize {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("↑"))
-            .end_symbol(Some("↓"));
+            .begin_symbol(Some("^"))
+            .end_symbol(Some("v"));
 
         let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_height as usize))
             .position(app.scroll_offset as usize);
@@ -899,4 +1084,94 @@ fn render_logs(f: &mut Frame, app: &mut TuiApp, area: ratatui::layout::Rect) {
             &mut scrollbar_state,
         );
     }
+}
+
+fn render_help_overlay(f: &mut Frame, _app: &TuiApp) {
+    let area = centered_rect(60, 80, f.area());
+
+    f.render_widget(Clear, area);
+
+    let help_text = vec![
+        Line::from(Span::styled("dev-proxy Help", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled("Navigation", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from("  Up/Down     Select server"),
+        Line::from("  Right       Enter logs view (navigate mode)"),
+        Line::from("  Left        Exit logs view"),
+        Line::from("  Home/End    Jump to first/last server"),
+        Line::from(""),
+        Line::from(Span::styled("Scrolling", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from("  A/Z         Scroll up/down (5 lines)"),
+        Line::from("  T/B         Jump to top/bottom"),
+        Line::from("  Mouse       Scroll wheel"),
+        Line::from(""),
+        Line::from(Span::styled("Server Control", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from("  Enter       Open server in browser"),
+        Line::from("  k           Kill selected server"),
+        Line::from("  r           Restart selected server"),
+        Line::from(""),
+        Line::from(Span::styled("Logs", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from("  /           Search/filter logs"),
+        Line::from("  c           Copy all logs to clipboard"),
+        Line::from("  f           Flush/clear logs"),
+        Line::from("  Space       Select text (in navigate mode)"),
+        Line::from(""),
+        Line::from(Span::styled("Other", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from("  ?           Toggle this help"),
+        Line::from("  q/Esc       Quit (or exit view)"),
+        Line::from(""),
+        Line::from(Span::styled("Press any key to close", Style::default().fg(Color::DarkGray))),
+    ];
+
+    let paragraph = Paragraph::new(help_text)
+        .block(
+            Block::default()
+                .title(" Help ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(paragraph, area);
+}
+
+fn render_search_overlay(f: &mut Frame, app: &TuiApp) {
+    let area = centered_rect(50, 10, f.area());
+
+    f.render_widget(Clear, area);
+
+    let search_text = format!("/{}", app.search_query);
+
+    let paragraph = Paragraph::new(Line::from(vec![
+        Span::raw(&search_text),
+        Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+    ]))
+    .block(
+        Block::default()
+            .title(" Search (Enter to confirm, Esc to cancel) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+
+    f.render_widget(paragraph, area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
