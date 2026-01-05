@@ -65,7 +65,7 @@ struct Args {
     no_ui: bool,
 
     /// Idle timeout in seconds (0 = disabled)
-    #[arg(long, default_value = "900", global = true)]
+    #[arg(long, default_value = "0", global = true)]
     idle_timeout: u64,
 }
 
